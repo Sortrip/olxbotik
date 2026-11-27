@@ -10,6 +10,8 @@ OLX-монитор в Telegram: меню, несколько поисков, к�
   PROXY          необязательно, прокси для запросов к OLX, например http://user:pass@host:port
   RUN_SECONDS    для GitHub Actions: через сколько секунд бот сам остановится (0 = работать вечно)
   FULL_CARDS_FREE  1 = полные карточки (фото, описание, продавец) у всех, 0 = только у премиума
+  MAX_AGE_MINUTES  присылать только объявления не старше N минут (по умолчанию 60, 0 = выкл.)
+  MAX_AGE_DAYS   0 = присылать только сегодняшние объявления, 1 = ещё и вчерашние
 Админ-команда /ad ссылка_на_объявление показывает, что бот смог вытащить из страницы.
 """
 import asyncio
@@ -19,8 +21,10 @@ import os
 import re
 import sqlite3
 import time
+from datetime import date, datetime, timedelta, timezone
 from html import escape
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
+from zoneinfo import ZoneInfo
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F, Router
@@ -40,6 +44,9 @@ PROXY = os.environ.get("PROXY") or None
 RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "0"))
 FULL_CARDS_FREE = os.environ.get("FULL_CARDS_FREE", "1") == "1"  # 0 = полные карточки только у премиума
 MAX_PHOTOS = 4
+VERSION = "v6 (фильтр по времени)"
+MAX_AGE_MINUTES = int(os.environ.get("MAX_AGE_MINUTES", "60"))  # объявления старше этого не присылаем (0 = выкл.)
+MAX_AGE_DAYS = int(os.environ.get("MAX_AGE_DAYS", "0"))  # 0 = только сегодняшние, 1 = сегодня и вчера
 
 PREMIUM_DAYS = 30
 FREE_LIMIT, PREMIUM_LIMIT = 1, 10            # сколько поисков можно держать
@@ -78,6 +85,51 @@ def is_premium(uid):
 
 def fmt_date(ts):
     return time.strftime("%d.%m.%Y", time.localtime(ts))
+
+
+# ---------- свежесть объявлений ----------
+MONTHS = {"січня": 1, "лютого": 2, "березня": 3, "квітня": 4, "травня": 5, "червня": 6, "липня": 7,
+          "серпня": 8, "вересня": 9, "жовтня": 10, "листопада": 11, "грудня": 12,
+          "января": 1, "февраля": 2, "марта": 3, "апреля": 4, "мая": 5, "июня": 6, "июля": 7,
+          "августа": 8, "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12}
+
+
+def now_kyiv():
+    try:
+        return datetime.now(ZoneInfo("Europe/Kyiv"))
+    except Exception:
+        return datetime.now(timezone(timedelta(hours=2)))
+
+
+def is_fresh_text(text):
+    """True, если по тексту с датой объявление свежее (или дату понять не удалось)."""
+    t = (text or "").lower()
+    now = now_kyiv()
+    if not t:
+        return True
+    if "сьогодні" in t or "сегодня" in t:
+        m = re.search(r"(\d{1,2}):(\d{2})", t)
+        if MAX_AGE_MINUTES and m:
+            try:
+                ad_time = now.replace(hour=int(m.group(1)) % 24, minute=int(m.group(2)), second=0, microsecond=0)
+            except ValueError:
+                return True
+            if ad_time <= now:
+                return (now - ad_time) <= timedelta(minutes=MAX_AGE_MINUTES)
+        return True
+    if "вчора" in t or "вчера" in t:
+        return MAX_AGE_DAYS >= 1 or now.hour < 1
+    m = re.search(r"(\d{1,2})\s+([а-яіїєґ]+)\s+(\d{4})", t)
+    if not m or m.group(2) not in MONTHS:
+        return True
+    try:
+        ad_date = date(int(m.group(3)), MONTHS[m.group(2)], int(m.group(1)))
+    except ValueError:
+        return True
+    limit = now.date() - timedelta(days=MAX_AGE_DAYS)
+    if now.hour < 1:  # сразу после полуночи не режем вчерашнее
+        limit -= timedelta(days=1)
+    return ad_date >= limit
 
 
 # ---------- OLX ----------
@@ -271,7 +323,7 @@ def build_caption(ad, d):
         head += f"💰 {escape(price)}\n"
     if loc:
         head += f"📍 {escape(loc)}\n"
-    if d.get("date"):
+    if d.get("date") and not re.search(r"\d{4}|сьогодні|сегодня", loc.lower()):
         head += f"🕒 {escape(d['date'])}\n"
     if d.get("seller"):
         head += "👤 " + escape(d["seller"] + (f" · {d['since']}" if d.get("since") else "")) + "\n"
@@ -359,8 +411,17 @@ async def poller(bot):
                     continue
                 db.commit()
                 full = FULL_CARDS_FREE or is_premium(s["user_id"])
-                for _, a in reversed(new[:10]):  # старые первыми, новые последними
+                fresh = []
+                for i, a in new:  # старые и «ТОП» пропускаем
+                    if is_fresh_text(a["loc"]):
+                        fresh.append((i, a))
+                    else:
+                        logging.info("пропущено старое: %s | %s", a["link"], a["loc"])
+                for _, a in reversed(fresh[:10]):  # старые первыми, новые последними
                     d = await get_details(session, a) if full else None
+                    if d and not is_fresh_text(d.get("date")):
+                        logging.info("пропущено старое (страница): %s | %s", a["link"], d.get("date"))
+                        continue
                     await send_ad(bot, s["user_id"], a, d)
                     await asyncio.sleep(0.5)
             await asyncio.sleep(TICK)
@@ -538,6 +599,11 @@ async def main():
     bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
     dp.include_router(router)
+    if ADMIN_ID:
+        age = (f"не старше {MAX_AGE_MINUTES} мин." if MAX_AGE_MINUTES else
+               "только сегодняшние" if MAX_AGE_DAYS == 0 else f"за последние {MAX_AGE_DAYS + 1} дн.")
+        await safe_send(bot, ADMIN_ID, f"🟢 Бот запущен, версия {VERSION}\nПрисылаю: {age}",
+                        disable_notification=True)
     task = asyncio.create_task(poller(bot))
     if RUN_SECONDS:
         async def stopper():
