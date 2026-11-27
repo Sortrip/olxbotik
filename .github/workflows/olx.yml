@@ -25,7 +25,11 @@ jobs:
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           ADMIN_ID: ${{ secrets.TG_CHAT_ID }}
-          PRICE_STARS: "1"
+          PRICE_30: "50"
+          PRICE_90: "130"
+          PRICE_FOREVER: "1000"
+          MAX_AGE_MINUTES: "60"
+          STRICT_DATE: "1"
           SUPPORT: "@AzeiroKok"
           RUN_SECONDS: "19500"
       - uses: actions/cache/save@v4
