@@ -10,11 +10,12 @@ OLX-монитор в Telegram: меню, несколько поисков, к�
   PROXY          необязательно, прокси для запросов к OLX, например http://user:pass@host:port
   RUN_SECONDS    для GitHub Actions: через сколько секунд бот сам остановится (0 = работать вечно)
   FULL_CARDS_FREE  1 = полные карточки (фото, описание, продавец) у всех, 0 = только у премиума
-  MAX_AGE_MINUTES  присылать только объявления не старше N минут (по умолчанию 60, 0 = выкл.)
+  MAX_AGE_MINUTES  присылать только объявления не старше N минут (по умолчанию 10, 0 = выкл.)
   MAX_AGE_DAYS   0 = присылать только сегодняшние объявления, 1 = ещё и вчерашние (если MAX_AGE_MINUTES=0)
   STRICT_DATE    1 = если возраст объявления определить нельзя, НЕ присылать (по умолчанию 1)
   SKIP_REFRESHED 1 = не присылать поднятые/обновлённые старые объявления («Оновлено ...»), по умолчанию 1
-Админ-команда /ad ссылка_на_объявление показывает, что бот смог вытащить из страницы.
+  TRIAL_DAYS     сколько дней премиума дарим новому пользователю (по умолчанию 2, 0 = выкл.)
+Админ-команды: /ad ссылка, /grant id дни|forever, /refund id charge_id, /stats
 """
 import asyncio
 import json
@@ -45,15 +46,18 @@ PROXY = os.environ.get("PROXY") or None
 RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "0"))
 FULL_CARDS_FREE = os.environ.get("FULL_CARDS_FREE", "1") == "1"  # 0 = полные карточки только у премиума
 MAX_PHOTOS = 4
-VERSION = "v7 (строгий фильтр времени, тарифы, рефералка)"
-MAX_AGE_MINUTES = int(os.environ.get("MAX_AGE_MINUTES", "60"))  # объявления старше этого не присылаем (0 = выкл.)
+VERSION = "v8 (10 мин, RU/UA, триал, рефералка 2.0)"
+MAX_AGE_MINUTES = int(os.environ.get("MAX_AGE_MINUTES", "15"))  # объявления старше этого не присылаем (0 = выкл.)
 MAX_AGE_DAYS = int(os.environ.get("MAX_AGE_DAYS", "0"))  # 0 = только сегодняшние, 1 = сегодня и вчера
 STRICT_DATE = os.environ.get("STRICT_DATE", "1") == "1"  # возраст неизвестен -> не присылаем
 SKIP_REFRESHED = os.environ.get("SKIP_REFRESHED", "1") == "1"  # «Оновлено» = старое объявление
 
 FOREVER_DAYS = 365 * 50                      # «навсегда» = 50 лет
 FOREVER_CUTOFF = 20 * 365 * 86400            # всё, что дальше 20 лет, показываем как «навсегда»
-REF_BONUS_DAYS = 1                           # дней премиума за каждого приглашённого
+REF_BONUS_DAYS = 1                           # пригласившему, когда друг добавил первый поиск
+REF_INVITED_BONUS_DAYS = 1                   # приглашённому сразу (сверху к триалу)
+MILESTONE_EVERY, MILESTONE_BONUS_DAYS = 5, 7  # каждый 5-й друг = ещё +7 дней
+TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "2"))  # подарок новичку
 # Тарифы. Хочешь добавить ещё — просто допиши строку (ключ без двоеточий).
 PLANS = {
     "30": {"days": 30, "stars": int(os.environ.get("PRICE_30", "50")), "label": "30 дней"},
@@ -77,15 +81,155 @@ CREATE TABLE IF NOT EXISTS seen(search_id INTEGER, ad_id TEXT, PRIMARY KEY(searc
 CREATE TABLE IF NOT EXISTS payments(charge_id TEXT PRIMARY KEY, user_id INTEGER, stars INTEGER, ts REAL);
 CREATE TABLE IF NOT EXISTS referrals(invited_id INTEGER PRIMARY KEY, referrer_id INTEGER, ts REAL);
 """)
+
+
+def add_column(table, ddl):
+    try:
+        db.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+        db.commit()
+        return True
+    except sqlite3.OperationalError:  # колонка уже есть
+        return False
+
+
+add_column("users", "lang TEXT DEFAULT ''")
+add_column("users", "warn_for REAL DEFAULT 0")
+if add_column("users", "exp_for REAL DEFAULT 0"):  # первый запуск этой версии: по давно истёкшим не шлём уведомления
+    db.execute("UPDATE users SET exp_for=premium_until WHERE premium_until>0 AND premium_until<?", (time.time(),))
+    db.commit()
+add_column("referrals", "rewarded INTEGER DEFAULT 1")  # старые рефералы уже награждены
 router = Router()
 
 
+
+# ---------- тексты ----------
+TXT = {
+    "ru": {
+        "start": "Привет! Я слежу за новыми объявлениями на OLX и сразу присылаю их сюда.\n\n"
+                 "Открой olx.ua, выставь нужные фильтры и пришли мне ссылку на результаты поиска.",
+        "gift": "🎁 <b>Подарок: {days} дн. премиума</b> — до {pl} поисков, проверка каждую минуту, карточки без подписи бота. "
+                "Премиум активен {until}.",
+        "add_help": "Открой olx.ua, выставь фильтры (категория, город, цена) и пришли мне ссылку из адресной строки.",
+        "limit": "Лимит поисков: {limit}. Удали лишний в «Мои поиски» или возьми премиум 👇",
+        "added": "Добавил поиск #{id}. Через несколько секунд подтвержу запуск.",
+        "started": "✅ Поиск #{id} запущен. Запомнил {n} текущих объявлений, дальше пришлю только новые.",
+        "no_searches": "Поисков пока нет. Пришли ссылку с OLX.",
+        "btn_add": "➕ Добавить поиск", "btn_list": "📋 Мои поиски", "btn_premium": "⭐ Премиум",
+        "btn_ref": "👥 Пригласить друга", "btn_lang": "🌐 Мова / Язык",
+        "btn_pause": "⏸ Пауза #{id}", "btn_resume": "▶️ Включить #{id}", "btn_del": "🗑 Удалить #{id}",
+        "done": "Готово", "deleted": "Удалил",
+        "active_limit": "Лимит активных поисков: {limit}. Поставь другой на паузу или возьми премиум.",
+        "prem_active": "Премиум активен {until}.", "prem_free": "Сейчас у тебя бесплатный тариф.",
+        "prem_body": "<b>Бесплатно:</b> {fl} поиск, проверка раз в {fi} мин.\n"
+                     "<b>Премиум:</b> до {pl} поисков, проверка каждую минуту ⚡, карточки без подписи бота.\n"
+                     "<b>Навсегда:</b> всё то же + все будущие обновления без доплат.",
+        "btn_ref_free": "👥 Бесплатно за друзей",
+        "plan_30": "30 дней", "plan_90": "90 дней", "plan_forever": "Навсегда ♾",
+        "ref_text": "👥 <b>Приглашай друзей — получай премиум</b>\n\n"
+                    "Когда друг запустит бота по твоей ссылке и добавит первый поиск, ты получишь "
+                    "<b>+{bonus} дн. премиума</b>, а друг — +{inv} дн. в подарок.\n"
+                    "🏆 Каждый {every}-й друг — ещё <b>+{mb} дн.</b> сверху.\n\n"
+                    "Твоя ссылка:\n<code>{link}</code>\n\n"
+                    "Засчитано приглашений: {n}\nЖдут первого поиска: {p}\n"
+                    "Получено: {earned} дн.\nДо следующего бонуса: {left}",
+        "btn_share": "📤 Поделиться ссылкой",
+        "share_text": "Бот, который мгновенно присылает новые объявления с OLX",
+        "ref_reward": "🎉 Твой друг добавил первый поиск — тебе <b>+{days} дн.</b> премиума! Премиум активен {until}.",
+        "ref_milestone": "🏆 Ты пригласил уже {n} друзей — бонус <b>+{days} дн.</b> сверху!",
+        "inv_title": "Премиум: {plan}", "inv_desc": "До {pl} поисков и проверка каждую минуту", "inv_label": "Премиум",
+        "paid": "⭐ Спасибо! Премиум ({plan}) активен {until}.",
+        "paysupport": "По вопросам оплаты и возвратов пиши {support}.",
+        "plan_missing": "Тариф не найден, открой меню и попробуй снова.",
+        "price_changed": "Цена изменилась, открой меню и выбери тариф заново.",
+        "plan_alert": "Тариф не найден",
+        "expiring": "⏳ Твой премиум закончится в течение суток. Продли, чтобы не терять быстрые проверки и лишние поиски 👇",
+        "expired": "⌛ Премиум закончился. Теперь проверка раз в {fi} мин., активен {fl} поиск.{paused}\n"
+                   "Продли, чтобы снова получать объявления за минуту 👇",
+        "paused_note": "\nПоисков поставлено на паузу: {n}.",
+        "teaser_age": "⏱ Ты увидел это через {n} мин. после публикации.\n⚡ В премиуме проверка каждую минуту.",
+        "teaser": "⚡ В премиуме проверка каждую минуту, до {pl} поисков.",
+        "btn_speedup": "⚡ Получать быстрее",
+        "open_olx": "Открыть на OLX →", "since": "на OLX с {d}",
+        "lang_set": "Язык: русский 🇷🇺",
+        "forever": "навсегда",
+    },
+    "ua": {
+        "start": "Привіт! Я стежу за новими оголошеннями на OLX і одразу надсилаю їх сюди.\n\n"
+                 "Відкрий olx.ua, постав потрібні фільтри й надішли мені посилання на результати пошуку.",
+        "gift": "🎁 <b>Подарунок: {days} дн. преміуму</b> — до {pl} пошуків, перевірка щохвилини, картки без підпису бота. "
+                "Преміум активний {until}.",
+        "add_help": "Відкрий olx.ua, постав фільтри (категорія, місто, ціна) і надішли мені посилання з адресного рядка.",
+        "limit": "Ліміт пошуків: {limit}. Видали зайвий у «Мої пошуки» або візьми преміум 👇",
+        "added": "Додав пошук #{id}. За кілька секунд підтверджу запуск.",
+        "started": "✅ Пошук #{id} запущено. Запам'ятав {n} поточних оголошень, далі надішлю лише нові.",
+        "no_searches": "Пошуків поки немає. Надішли посилання з OLX.",
+        "btn_add": "➕ Додати пошук", "btn_list": "📋 Мої пошуки", "btn_premium": "⭐ Преміум",
+        "btn_ref": "👥 Запросити друга", "btn_lang": "🌐 Мова / Язык",
+        "btn_pause": "⏸ Пауза #{id}", "btn_resume": "▶️ Увімкнути #{id}", "btn_del": "🗑 Видалити #{id}",
+        "done": "Готово", "deleted": "Видалив",
+        "active_limit": "Ліміт активних пошуків: {limit}. Постав інший на паузу або візьми преміум.",
+        "prem_active": "Преміум активний {until}.", "prem_free": "Зараз у тебе безкоштовний тариф.",
+        "prem_body": "<b>Безкоштовно:</b> {fl} пошук, перевірка раз на {fi} хв.\n"
+                     "<b>Преміум:</b> до {pl} пошуків, перевірка щохвилини ⚡, картки без підпису бота.\n"
+                     "<b>Назавжди:</b> те саме + усі майбутні оновлення без доплат.",
+        "btn_ref_free": "👥 Безкоштовно за друзів",
+        "plan_30": "30 днів", "plan_90": "90 днів", "plan_forever": "Назавжди ♾",
+        "ref_text": "👥 <b>Запрошуй друзів — отримуй преміум</b>\n\n"
+                    "Коли друг запустить бота за твоїм посиланням і додасть перший пошук, ти отримаєш "
+                    "<b>+{bonus} дн. преміуму</b>, а друг — +{inv} дн. у подарунок.\n"
+                    "🏆 Кожен {every}-й друг — ще <b>+{mb} дн.</b> зверху.\n\n"
+                    "Твоє посилання:\n<code>{link}</code>\n\n"
+                    "Зараховано запрошень: {n}\nЧекають на перший пошук: {p}\n"
+                    "Отримано: {earned} дн.\nДо наступного бонусу: {left}",
+        "btn_share": "📤 Поділитися посиланням",
+        "share_text": "Бот, який миттєво надсилає нові оголошення з OLX",
+        "ref_reward": "🎉 Твій друг додав перший пошук — тобі <b>+{days} дн.</b> преміуму! Преміум активний {until}.",
+        "ref_milestone": "🏆 Ти вже запросив {n} друзів — бонус <b>+{days} дн.</b> зверху!",
+        "inv_title": "Преміум: {plan}", "inv_desc": "До {pl} пошуків і перевірка щохвилини", "inv_label": "Преміум",
+        "paid": "⭐ Дякую! Преміум ({plan}) активний {until}.",
+        "paysupport": "З питань оплати й повернень пиши {support}.",
+        "plan_missing": "Тариф не знайдено, відкрий меню й спробуй знову.",
+        "price_changed": "Ціна змінилась, відкрий меню й обери тариф знову.",
+        "plan_alert": "Тариф не знайдено",
+        "expiring": "⏳ Твій преміум закінчиться протягом доби. Продовж, щоб не втратити швидкі перевірки та зайві пошуки 👇",
+        "expired": "⌛ Преміум закінчився. Тепер перевірка раз на {fi} хв., активний {fl} пошук.{paused}\n"
+                   "Продовж, щоб знову отримувати оголошення за хвилину 👇",
+        "paused_note": "\nПошуків поставлено на паузу: {n}.",
+        "teaser_age": "⏱ Ти побачив це через {n} хв. після публікації.\n⚡ У преміумі перевірка щохвилини.",
+        "teaser": "⚡ У преміумі перевірка щохвилини, до {pl} пошуків.",
+        "btn_speedup": "⚡ Отримувати швидше",
+        "open_olx": "Відкрити на OLX →", "since": "на OLX з {d}",
+        "lang_set": "Мова: українська 🇺🇦",
+        "forever": "назавжди",
+    },
+}
+
+
 # ---------- база ----------
-def ensure_user(uid):
-    """True, если пользователь только что появился в базе."""
-    cur = db.execute("INSERT OR IGNORE INTO users(id) VALUES(?)", (uid,))
+def ensure_user(uid, lang_code=None):
+    """True, если пользователь только что появился в базе. Язык берём из настроек Telegram."""
+    lang = "ua" if (lang_code or "").lower().startswith("uk") else "ru"
+    cur = db.execute("INSERT OR IGNORE INTO users(id, lang) VALUES(?,?)", (uid, lang))
+    if cur.rowcount != 1 and lang_code:
+        db.execute("UPDATE users SET lang=? WHERE id=? AND (lang IS NULL OR lang='')", (lang, uid))
     db.commit()
     return cur.rowcount == 1
+
+
+def lang_of(uid):
+    r = db.execute("SELECT lang FROM users WHERE id=?", (uid,)).fetchone()
+    return r["lang"] if r and r["lang"] in TXT else "ru"
+
+
+def tr(uid, key, **kw):
+    return TXT[lang_of(uid)][key].format(**kw)
+
+
+def add_premium(uid, days):
+    until = max(time.time(), premium_until(uid)) + days * 86400
+    db.execute("UPDATE users SET premium_until=? WHERE id=?", (until, uid))
+    db.commit()
+    return until
 
 
 def premium_until(uid):
@@ -101,8 +245,8 @@ def fmt_date(ts):
     return time.strftime("%d.%m.%Y", time.localtime(ts))
 
 
-def fmt_until(ts):
-    return "навсегда" if ts - time.time() > FOREVER_CUTOFF else f"до {fmt_date(ts)}"
+def fmt_until(ts, lang="ru"):
+    return TXT[lang]["forever"] if ts - time.time() > FOREVER_CUTOFF else f"до {fmt_date(ts)}"
 
 
 # ---------- свежесть объявлений ----------
@@ -284,7 +428,7 @@ def html_to_text(s):
 
 def since_text(s):
     m = re.match(r"(\d{4})-(\d{2})", s or "")
-    return f"на OLX с {m.group(2)}.{m.group(1)}" if m else (s or "")
+    return f"{m.group(2)}.{m.group(1)}" if m else (s or "")
 
 
 def parse_ad_page(page):
@@ -387,7 +531,8 @@ async def get_details(session, ad):
     return d
 
 
-def build_caption(ad, d):
+def build_caption(ad, d, lang="ru", foot_extra=""):
+    t = TXT[lang]
     title = ad["title"] if ad["title"] != "Объявление" else (d.get("title") or "Объявление")
     price = ad["price"] or d.get("price", "")
     loc = ad["loc"] or d.get("loc", "")
@@ -399,10 +544,13 @@ def build_caption(ad, d):
     if d.get("date") and not re.search(r"\d{4}|сьогодні|сегодня", loc.lower()):
         head += f"🕒 {escape(d['date'])}\n"
     if d.get("seller"):
-        head += "👤 " + escape(d["seller"] + (f" · {d['since']}" if d.get("since") else "")) + "\n"
+        since = d.get("since") or ""
+        if re.fullmatch(r"\d{2}\.\d{4}", since):
+            since = t["since"].format(d=since)
+        head += "👤 " + escape(d["seller"] + (f" · {since}" if since else "")) + "\n"
     if d.get("params"):
         head += "🔧 " + escape(" · ".join(d["params"][:5])) + "\n"
-    foot = f'\n<a href="{ad["link"]}">Открыть на OLX →</a>'
+    foot = f'\n<a href="{ad["link"]}">{t["open_olx"]}</a>' + foot_extra
     budget = 1024 - len(head) - len(foot) - 30
     desc = re.sub(r"\n{3,}", "\n\n", d.get("desc", "")).strip()
     if desc and budget > 80:
@@ -412,13 +560,36 @@ def build_caption(ad, d):
     return head + foot
 
 
+def ad_age_minutes(ad, d):
+    """Сколько минут объявлению (для подписи у бесплатных), None — если неизвестно."""
+    dt = parse_iso((d or {}).get("created"))
+    if not dt:
+        p = parse_ad_dt(ad.get("date"))
+        if p and p[1]:
+            dt = p[0]
+    if not dt:
+        return None
+    n = int((now_kyiv() - dt).total_seconds() // 60)
+    return n if 1 <= n <= 120 else None
+
+
 async def send_ad(bot, uid, ad, d=None):
     d = d or {}
-    text = build_caption(ad, d)
+    lang = lang_of(uid)
+    t = TXT[lang]
+    foot_extra, rows = "", [[InlineKeyboardButton(text=t["open_olx"], url=ad["link"])]]
+    if not is_premium(uid):
+        # бесплатным: подсказка про скорость премиума + реф-ссылка в подписи (карточки пересылают → приток людей)
+        me = await bot.me()
+        age = ad_age_minutes(ad, d)
+        hint = t["teaser_age"].format(n=age) if age else t["teaser"].format(pl=PREMIUM_LIMIT)
+        foot_extra = f'\n\n{hint}\n🤖 <a href="https://t.me/{me.username}?start=ref_{uid}">@{me.username}</a>'
+        rows.append([InlineKeyboardButton(text=t["btn_speedup"], callback_data="premium")])
+    text = build_caption(ad, d, lang, foot_extra)
     photos = d.get("photos") or ([ad["img"]] if ad["img"] else [])
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Открыть на OLX →", url=ad["link"])]])
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
     try:
-        if len(photos) > 1:  # альбом: подпись на первой фото
+        if len(photos) > 1:  # альбом: подпись на первой фото (кнопки у альбома не бывают)
             try:
                 media = [InputMediaPhoto(media=u, caption=text if i == 0 else None, parse_mode="HTML")
                          for i, u in enumerate(photos)]
@@ -478,9 +649,7 @@ async def poller(bot):
                 if not s["initialized"]:
                     db.execute("UPDATE searches SET initialized=1 WHERE id=?", (s["id"],))
                     db.commit()
-                    await safe_send(bot, s["user_id"],
-                                    f"✅ Поиск #{s['id']} запущен. Запомнил {len(ads)} текущих объявлений, "
-                                    f"дальше пришлю только новые.")
+                    await safe_send(bot, s["user_id"], tr(s["user_id"], "started", id=s["id"], n=len(ads)))
                     continue
                 db.commit()
                 full = FULL_CARDS_FREE or is_premium(s["user_id"])
@@ -511,70 +680,120 @@ async def poller(bot):
 
 
 # ---------- меню ----------
-def main_kb():
+def main_kb(uid):
+    t = TXT[lang_of(uid)]
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Добавить поиск", callback_data="add")],
-        [InlineKeyboardButton(text="📋 Мои поиски", callback_data="list")],
-        [InlineKeyboardButton(text="⭐ Премиум", callback_data="premium")],
-        [InlineKeyboardButton(text=f"👥 Пригласить друга (+{REF_BONUS_DAYS} день)", callback_data="ref")],
+        [InlineKeyboardButton(text=t["btn_add"], callback_data="add")],
+        [InlineKeyboardButton(text=t["btn_list"], callback_data="list")],
+        [InlineKeyboardButton(text=t["btn_premium"], callback_data="premium")],
+        [InlineKeyboardButton(text=t["btn_ref"], callback_data="ref")],
+        [InlineKeyboardButton(text=t["btn_lang"], callback_data="lang")],
     ])
+
+
+def plan_label(uid, key):
+    return TXT[lang_of(uid)]["plan_" + key]
+
+
+def plan_line(uid, key):
+    p = PLANS[key]
+    line = f"{plan_label(uid, key)} — {p['stars']} ⭐"
+    if key != "forever" and p["days"] > 30:
+        save = round(100 - 100 * p["stars"] / (PLANS["30"]["stars"] * p["days"] / 30))
+        if save > 0:
+            line += f" (−{save}%)"
+    return line
+
+
+def premium_kb(uid, with_ref=True):
+    rows = [[InlineKeyboardButton(text=plan_line(uid, k), callback_data=f"buy:{k}")] for k in PLANS]
+    if with_ref:
+        rows.append([InlineKeyboardButton(text=tr(uid, "btn_ref_free"), callback_data="ref")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 @router.message(CommandStart())
 async def start(m: Message, command: CommandObject):
-    is_new = ensure_user(m.from_user.id)
-    if is_new and command.args and command.args.startswith("ref_"):
-        await handle_referral(m.bot, m.from_user.id, command.args[4:])
-    await m.answer("Привет! Я слежу за новыми объявлениями на OLX и сразу присылаю их сюда.\n\n"
-                   "Открой olx.ua, выставь нужные фильтры и пришли мне ссылку на результаты поиска.",
-                   reply_markup=main_kb())
+    uid = m.from_user.id
+    is_new = ensure_user(uid, m.from_user.language_code)
+    bonus = 0
+    if is_new:
+        bonus = TRIAL_DAYS
+        if command.args and command.args.startswith("ref_") and register_referral(uid, command.args[4:]):
+            bonus += REF_INVITED_BONUS_DAYS
+    text = tr(uid, "start")
+    if bonus:
+        until = add_premium(uid, bonus)
+        text = tr(uid, "gift", days=bonus, pl=PREMIUM_LIMIT, until=fmt_until(until, lang_of(uid))) + "\n\n" + text
+    await m.answer(text, reply_markup=main_kb(uid))
+
+
+@router.callback_query(F.data == "lang")
+async def switch_lang(c: CallbackQuery):
+    uid = c.from_user.id
+    ensure_user(uid, c.from_user.language_code)
+    new = "ua" if lang_of(uid) == "ru" else "ru"
+    db.execute("UPDATE users SET lang=? WHERE id=?", (new, uid))
+    db.commit()
+    await c.message.answer(tr(uid, "lang_set") + "\n\n" + tr(uid, "start"), reply_markup=main_kb(uid))
+    await c.answer()
 
 
 @router.callback_query(F.data == "add")
 async def add_help(c: CallbackQuery):
-    await c.message.answer("Открой olx.ua, выставь фильтры (категория, город, цена) и пришли мне ссылку из адресной строки.")
+    await c.message.answer(tr(c.from_user.id, "add_help"))
     await c.answer()
 
 
 @router.message(F.text.regexp(r"https?://\S*olx\.ua\S*"))
 async def add_search(m: Message):
     uid = m.from_user.id
-    ensure_user(uid)
+    ensure_user(uid, m.from_user.language_code)
     limit = PREMIUM_LIMIT if is_premium(uid) else FREE_LIMIT
     count = db.execute("SELECT COUNT(*) FROM searches WHERE user_id=?", (uid,)).fetchone()[0]
     if count >= limit:
-        await m.answer(f"Лимит поисков: {limit}. Удали лишний в «Мои поиски» или возьми премиум.",
-                       reply_markup=main_kb())
+        await m.answer(tr(uid, "limit", limit=limit), reply_markup=premium_kb(uid))
         return
     url = prepare_url(re.search(r"https?://\S+", m.text).group(0))
     cur = db.execute("INSERT INTO searches(user_id, url) VALUES(?,?)", (uid, url))
     db.commit()
-    await m.answer(f"Добавил поиск #{cur.lastrowid}. Через несколько секунд подтвержу запуск.")
+    await m.answer(tr(uid, "added", id=cur.lastrowid))
+    await reward_referrer(m.bot, uid)  # друг добавил первый поиск -> бонус пригласившему
 
 
 @router.callback_query(F.data == "list")
 async def list_searches(c: CallbackQuery):
-    rows = db.execute("SELECT * FROM searches WHERE user_id=?", (c.from_user.id,)).fetchall()
+    uid = c.from_user.id
+    t = TXT[lang_of(uid)]
+    rows = db.execute("SELECT * FROM searches WHERE user_id=?", (uid,)).fetchall()
     if not rows:
-        await c.message.answer("Поисков пока нет. Пришли ссылку с OLX.", reply_markup=main_kb())
+        await c.message.answer(t["no_searches"], reply_markup=main_kb(uid))
         return await c.answer()
     lines, buttons = [], []
     for s in rows:
         path = urlparse(s["url"]).path.strip("/")[:45] or "olx.ua"
         lines.append(f"#{s['id']} {'🟢' if s['active'] else '⏸'} {escape(path)}")
-        buttons.append([InlineKeyboardButton(text=f"{'⏸ Пауза' if s['active'] else '▶️ Включить'} #{s['id']}",
+        buttons.append([InlineKeyboardButton(text=t["btn_pause" if s["active"] else "btn_resume"].format(id=s["id"]),
                                              callback_data=f"toggle:{s['id']}"),
-                        InlineKeyboardButton(text=f"🗑 Удалить #{s['id']}", callback_data=f"del:{s['id']}")])
+                        InlineKeyboardButton(text=t["btn_del"].format(id=s["id"]), callback_data=f"del:{s['id']}")])
     await c.message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
     await c.answer()
 
 
 @router.callback_query(F.data.startswith("toggle:"))
 async def toggle(c: CallbackQuery):
-    sid = int(c.data.split(":")[1])
-    db.execute("UPDATE searches SET active = 1 - active WHERE id=? AND user_id=?", (sid, c.from_user.id))
+    uid, sid = c.from_user.id, int(c.data.split(":")[1])
+    row = db.execute("SELECT active FROM searches WHERE id=? AND user_id=?", (sid, uid)).fetchone()
+    if not row:
+        return await c.answer()
+    if not row["active"]:  # включаем — проверяем лимит активных
+        limit = PREMIUM_LIMIT if is_premium(uid) else FREE_LIMIT
+        active = db.execute("SELECT COUNT(*) FROM searches WHERE user_id=? AND active=1", (uid,)).fetchone()[0]
+        if active >= limit:
+            return await c.answer(tr(uid, "active_limit", limit=limit), show_alert=True)
+    db.execute("UPDATE searches SET active = 1 - active WHERE id=? AND user_id=?", (sid, uid))
     db.commit()
-    await c.answer("Готово")
+    await c.answer(tr(uid, "done"))
 
 
 @router.callback_query(F.data.startswith("del:"))
@@ -583,119 +802,118 @@ async def delete(c: CallbackQuery):
     db.execute("DELETE FROM searches WHERE id=? AND user_id=?", (sid, c.from_user.id))
     db.execute("DELETE FROM seen WHERE search_id=?", (sid,))
     db.commit()
-    await c.answer("Удалил")
+    await c.answer(tr(c.from_user.id, "deleted"))
 
 
 # ---------- рефералка ----------
-async def handle_referral(bot, uid, arg):
-    """Новый пользователь пришёл по ссылке ref_<id>: даём пригласившему бонус (один раз за человека)."""
+def register_referral(uid, arg):
+    """Запоминаем, кто кого пригласил. Награда пригласившему — позже, когда друг добавит первый поиск."""
     try:
         ref = int(arg)
     except ValueError:
-        return
+        return False
     if ref == uid or not db.execute("SELECT 1 FROM users WHERE id=?", (ref,)).fetchone():
-        return
-    cur = db.execute("INSERT OR IGNORE INTO referrals(invited_id, referrer_id, ts) VALUES(?,?,?)",
+        return False
+    cur = db.execute("INSERT OR IGNORE INTO referrals(invited_id, referrer_id, ts, rewarded) VALUES(?,?,?,0)",
                      (uid, ref, time.time()))
-    if cur.rowcount != 1:
-        db.commit()
-        return
-    until = max(time.time(), premium_until(ref)) + REF_BONUS_DAYS * 86400
-    db.execute("UPDATE users SET premium_until=? WHERE id=?", (until, ref))
     db.commit()
-    await safe_send(bot, ref, f"🎉 По твоей ссылке пришёл новый пользователь! +{REF_BONUS_DAYS} дн. премиума.\n"
-                              f"Премиум активен {fmt_until(until)}.")
+    return cur.rowcount == 1
+
+
+async def reward_referrer(bot, uid):
+    r = db.execute("SELECT referrer_id FROM referrals WHERE invited_id=? AND rewarded=0", (uid,)).fetchone()
+    if not r:
+        return
+    ref = r["referrer_id"]
+    db.execute("UPDATE referrals SET rewarded=1 WHERE invited_id=?", (uid,))
+    db.commit()
+    until = add_premium(ref, REF_BONUS_DAYS)
+    n = db.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=? AND rewarded=1", (ref,)).fetchone()[0]
+    extra = ""
+    if MILESTONE_EVERY and n % MILESTONE_EVERY == 0:
+        until = add_premium(ref, MILESTONE_BONUS_DAYS)
+        extra = "\n" + tr(ref, "ref_milestone", n=n, days=MILESTONE_BONUS_DAYS)
+    await safe_send(bot, ref, tr(ref, "ref_reward", days=REF_BONUS_DAYS, until=fmt_until(until, lang_of(ref))) + extra)
 
 
 @router.callback_query(F.data == "ref")
 async def ref_info(c: CallbackQuery):
+    uid = c.from_user.id
+    t = TXT[lang_of(uid)]
     me = await c.bot.me()
-    link = f"https://t.me/{me.username}?start=ref_{c.from_user.id}"
-    n = db.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=?", (c.from_user.id,)).fetchone()[0]
-    share = "https://t.me/share/url?url=" + quote(link) + "&text=" + quote("Бот, который мгновенно присылает новые объявления с OLX")
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📤 Поделиться ссылкой", url=share)]])
-    await c.message.answer(
-        f"👥 <b>Приглашай друзей — получай премиум</b>\n\n"
-        f"За каждого нового пользователя, который запустит бота по твоей ссылке, "
-        f"ты получаешь <b>+{REF_BONUS_DAYS} день премиума</b>.\n\n"
-        f"Твоя ссылка:\n<code>{link}</code>\n\n"
-        f"Приглашено: {n}\nПолучено: {n * REF_BONUS_DAYS} дн.", reply_markup=kb)
+    link = f"https://t.me/{me.username}?start=ref_{uid}"
+    n = db.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=? AND rewarded=1", (uid,)).fetchone()[0]
+    pend = db.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=? AND rewarded=0", (uid,)).fetchone()[0]
+    earned = n * REF_BONUS_DAYS + (n // MILESTONE_EVERY) * MILESTONE_BONUS_DAYS
+    share = "https://t.me/share/url?url=" + quote(link) + "&text=" + quote(t["share_text"])
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=t["btn_share"], url=share)]])
+    await c.message.answer(t["ref_text"].format(
+        bonus=REF_BONUS_DAYS, inv=REF_INVITED_BONUS_DAYS, every=MILESTONE_EVERY, mb=MILESTONE_BONUS_DAYS,
+        link=link, n=n, p=pend, earned=earned, left=MILESTONE_EVERY - n % MILESTONE_EVERY), reply_markup=kb)
     await c.answer()
 
 
 # ---------- премиум за Stars ----------
-def plan_line(key):
-    p = PLANS[key]
-    line = f"{p['label']} — {p['stars']} ⭐"
-    if key != "forever" and p["days"] > 30:
-        save = round(100 - 100 * p["stars"] / (PLANS["30"]["stars"] * p["days"] / 30))
-        if save > 0:
-            line += f" (−{save}%)"
-    return line
-
-
 @router.callback_query(F.data == "premium")
 async def premium(c: CallbackQuery):
-    until = premium_until(c.from_user.id)
-    status = f"Премиум активен {fmt_until(until)}." if until > time.time() else "Сейчас у тебя бесплатный тариф."
-    rows = [[InlineKeyboardButton(text=plan_line(k), callback_data=f"buy:{k}")] for k in PLANS]
-    rows.append([InlineKeyboardButton(text=f"👥 Бесплатно за друзей (+{REF_BONUS_DAYS} день)", callback_data="ref")])
-    await c.message.answer(
-        f"{status}\n\n<b>Бесплатно:</b> {FREE_LIMIT} поиск, проверка раз в {FREE_INTERVAL // 60} мин.\n"
-        f"<b>Премиум:</b> до {PREMIUM_LIMIT} поисков, проверка раз в {PREMIUM_INTERVAL} сек.\n"
-        f"<b>Навсегда:</b> всё то же + все будущие обновления без доплат.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    uid = c.from_user.id
+    t = TXT[lang_of(uid)]
+    until = premium_until(uid)
+    status = t["prem_active"].format(until=fmt_until(until, lang_of(uid))) if until > time.time() else t["prem_free"]
+    body = t["prem_body"].format(fl=FREE_LIMIT, fi=FREE_INTERVAL // 60, pl=PREMIUM_LIMIT)
+    await c.message.answer(f"{status}\n\n{body}", reply_markup=premium_kb(uid))
     await c.answer()
 
 
 @router.callback_query(F.data.startswith("buy:"))
 async def buy(c: CallbackQuery):
+    uid = c.from_user.id
     key = c.data.split(":", 1)[1]
     plan = PLANS.get(key)
     if not plan:
-        return await c.answer("Тариф не найден", show_alert=True)
+        return await c.answer(tr(uid, "plan_alert"), show_alert=True)
     await c.message.answer_invoice(
-        title=f"Премиум: {plan['label']}",
-        description=f"До {PREMIUM_LIMIT} поисков и быстрая проверка новых объявлений",
-        payload=f"premium:{key}:{c.from_user.id}", provider_token="", currency="XTR",
-        prices=[LabeledPrice(label="Премиум", amount=plan["stars"])])
+        title=tr(uid, "inv_title", plan=plan_label(uid, key)),
+        description=tr(uid, "inv_desc", pl=PREMIUM_LIMIT),
+        payload=f"premium:{key}:{uid}", provider_token="", currency="XTR",
+        prices=[LabeledPrice(label=tr(uid, "inv_label"), amount=plan["stars"])])
     await c.answer()
 
 
 def plan_from_payload(payload):
+    """-> (ключ, тариф) или None."""
     parts = (payload or "").split(":")
     if parts[0] != "premium":
         return None
     if len(parts) == 2:  # старый формат счёта: premium:<uid> = 30 дней
-        return PLANS["30"]
-    return PLANS.get(parts[1])
+        return "30", PLANS["30"]
+    return (parts[1], PLANS[parts[1]]) if parts[1] in PLANS else None
 
 
 @router.pre_checkout_query()
 async def pre_checkout(q: PreCheckoutQuery):
-    plan = plan_from_payload(q.invoice_payload)
-    if not plan:
-        return await q.answer(ok=False, error_message="Тариф не найден, открой меню и попробуй снова.")
+    found = plan_from_payload(q.invoice_payload)
+    if not found:
+        return await q.answer(ok=False, error_message=tr(q.from_user.id, "plan_missing"))
     legacy = q.invoice_payload.count(":") == 1
-    if not legacy and q.total_amount != plan["stars"]:
-        return await q.answer(ok=False, error_message="Цена изменилась, открой меню и выбери тариф заново.")
+    if not legacy and q.total_amount != found[1]["stars"]:
+        return await q.answer(ok=False, error_message=tr(q.from_user.id, "price_changed"))
     await q.answer(ok=True)
 
 
 @router.message(F.successful_payment)
 async def paid(m: Message):
     p, uid = m.successful_payment, m.from_user.id
-    ensure_user(uid)
-    plan = plan_from_payload(p.invoice_payload) or PLANS["30"]
+    ensure_user(uid, m.from_user.language_code)
+    key, plan = plan_from_payload(p.invoice_payload) or ("30", PLANS["30"])
     cur = db.execute("INSERT OR IGNORE INTO payments VALUES(?,?,?,?)",
                      (p.telegram_payment_charge_id, uid, p.total_amount, time.time()))
     if cur.rowcount != 1:  # этот платёж уже обработан
         db.commit()
         return
-    until = max(time.time(), premium_until(uid)) + plan["days"] * 86400
-    db.execute("UPDATE users SET premium_until=? WHERE id=?", (until, uid))
-    db.commit()
-    await m.answer(f"⭐ Спасибо! Премиум ({plan['label']}) активен {fmt_until(until)}.", reply_markup=main_kb())
+    until = add_premium(uid, plan["days"])
+    await m.answer(tr(uid, "paid", plan=plan_label(uid, key), until=fmt_until(until, lang_of(uid))),
+                   reply_markup=main_kb(uid))
     if ADMIN_ID:
         await safe_send(m.bot, ADMIN_ID, f"💰 Оплата {p.total_amount}⭐ ({plan['label']}) от {uid}\n"
                                          f"charge_id: <code>{escape(p.telegram_payment_charge_id)}</code>")
@@ -703,7 +921,7 @@ async def paid(m: Message):
 
 @router.message(Command("paysupport"))
 async def paysupport(m: Message):
-    await m.answer(f"По вопросам оплаты и возвратов пиши {escape(SUPPORT)}.")
+    await m.answer(tr(m.from_user.id, "paysupport", support=escape(SUPPORT)))
 
 
 # ---------- админские команды ----------
@@ -738,6 +956,27 @@ async def refund(m: Message):
         await m.answer(f"Формат: /refund user_id charge_id\nОшибка: {escape(str(e))}")
 
 
+@router.message(Command("stats"))
+async def stats(m: Message):
+    if m.from_user.id != ADMIN_ID:
+        return
+    now = time.time()
+
+    def q(sql, *a):
+        return db.execute(sql, a).fetchone()[0]
+
+    ua = q("SELECT COUNT(*) FROM users WHERE lang='ua'")
+    await m.answer(
+        f"👥 Пользователей: {q('SELECT COUNT(*) FROM users')} (UA: {ua})\n"
+        f"⭐ С премиумом сейчас: {q('SELECT COUNT(*) FROM users WHERE premium_until>?', now)} "
+        f"(навсегда: {q('SELECT COUNT(*) FROM users WHERE premium_until>?', now + FOREVER_CUTOFF)})\n"
+        f"💳 Платили: {q('SELECT COUNT(DISTINCT user_id) FROM payments')} чел., "
+        f"{q('SELECT COALESCE(SUM(stars),0) FROM payments')} ⭐\n"
+        f"🔗 Рефералов засчитано: {q('SELECT COUNT(*) FROM referrals WHERE rewarded=1')}, "
+        f"ждут первого поиска: {q('SELECT COUNT(*) FROM referrals WHERE rewarded=0')}\n"
+        f"🔎 Активных поисков: {q('SELECT COUNT(*) FROM searches WHERE active=1')}")
+
+
 @router.message(Command("ad"))
 async def debug_ad(m: Message):
     if m.from_user.id != ADMIN_ID:
@@ -756,6 +995,43 @@ async def debug_ad(m: Message):
     await send_ad(m.bot, m.from_user.id, {"link": parts[1], "title": "Объявление", "price": "", "loc": "", "date": "", "img": ""}, d)
 
 
+def enforce_limit(uid):
+    """Бесплатному оставляем FREE_LIMIT самых старых активных поисков, остальные ставим на паузу."""
+    rows = db.execute("SELECT id FROM searches WHERE user_id=? AND active=1 ORDER BY id", (uid,)).fetchall()
+    extra = [r["id"] for r in rows[FREE_LIMIT:]]
+    for sid in extra:
+        db.execute("UPDATE searches SET active=0 WHERE id=?", (sid,))
+    db.commit()
+    return len(extra)
+
+
+async def premium_watch(bot):
+    """Предупреждаем за сутки до конца премиума и после окончания возвращаем лимиты бесплатного тарифа."""
+    while True:
+        try:
+            now = time.time()
+            for u in db.execute("SELECT id, premium_until FROM users WHERE premium_until>? AND premium_until<=? "
+                                "AND warn_for!=premium_until", (now, now + 86400)).fetchall():
+                db.execute("UPDATE users SET warn_for=? WHERE id=?", (u["premium_until"], u["id"]))
+                db.commit()
+                await safe_send(bot, u["id"], tr(u["id"], "expiring"), reply_markup=premium_kb(u["id"]))
+            for u in db.execute("SELECT id, premium_until FROM users WHERE premium_until>0 AND premium_until<=? "
+                                "AND exp_for!=premium_until", (now,)).fetchall():
+                db.execute("UPDATE users SET exp_for=? WHERE id=?", (u["premium_until"], u["id"]))
+                db.commit()
+                n = enforce_limit(u["id"])
+                note = tr(u["id"], "paused_note", n=n) if n else ""
+                await safe_send(bot, u["id"], tr(u["id"], "expired", fi=FREE_INTERVAL // 60, fl=FREE_LIMIT, paused=note),
+                                reply_markup=premium_kb(u["id"]))
+            for r in db.execute("SELECT s.user_id FROM searches s JOIN users u ON u.id=s.user_id "
+                                "WHERE s.active=1 AND u.premium_until<=? GROUP BY s.user_id HAVING COUNT(*)>?",
+                                (now, FREE_LIMIT)).fetchall():
+                enforce_limit(r["user_id"])
+        except Exception:
+            logging.exception("premium_watch")
+        await asyncio.sleep(120)
+
+
 async def main():
     logging.basicConfig(level=logging.INFO)
     bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -767,6 +1043,7 @@ async def main():
         await safe_send(bot, ADMIN_ID, f"🟢 Бот запущен, версия {VERSION}\nПрисылаю: {age}",
                         disable_notification=True)
     task = asyncio.create_task(poller(bot))
+    watch = asyncio.create_task(premium_watch(bot))
     if RUN_SECONDS:
         async def stopper():
             await asyncio.sleep(RUN_SECONDS)
@@ -776,6 +1053,7 @@ async def main():
         await dp.start_polling(bot)
     finally:
         task.cancel()
+        watch.cancel()
         db.commit()
         db.close()
 
