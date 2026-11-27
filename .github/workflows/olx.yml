@@ -1,30 +1,35 @@
-name: OLX monitor
+name: OLX bot
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "15 */2 * * *"
   workflow_dispatch:
 concurrency:
-  group: olx
+  group: olx-bot
   cancel-in-progress: false
-permissions:
-  contents: write
 jobs:
-  check:
+  run:
     runs-on: ubuntu-latest
+    timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install requests beautifulsoup4
-      - run: python bot.py
+      - run: pip install -U aiogram aiohttp beautifulsoup4
+      - uses: actions/cache/restore@v4
+        with:
+          path: olx.db
+          key: db-${{ github.run_id }}
+          restore-keys: db-
+      - run: python olx_bot.py
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          OLX_URL: ${{ secrets.OLX_URL }}
-      - name: Save state
-        run: |
-          git config user.name "olx-bot"
-          git config user.email "olx-bot@users.noreply.github.com"
-          git add seen.json
-          git diff --cached --quiet || (git commit -m "update seen" && git push)
+          ADMIN_ID: ${{ secrets.TG_CHAT_ID }}
+          PRICE_STARS: "1"
+          SUPPORT: "@AzeiroKok"
+          RUN_SECONDS: "19500"
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: olx.db
+          key: db-${{ github.run_id }}
