@@ -5,13 +5,15 @@ OLX-монитор в Telegram: меню, несколько поисков, к�
 Переменные окружения:
   TG_TOKEN       токен от BotFather (обязательно)
   ADMIN_ID       твой Telegram Id (для /grant, /refund и уведомлений об ошибках)
-  PRICE_STARS    цена премиума за 30 дней в звёздах (по умолчанию 100)
+  PRICE_30 / PRICE_90 / PRICE_FOREVER   цены тарифов в звёздах (по умолчанию 50 / 130 / 1000)
   SUPPORT        контакт для вопросов по оплате, например @username
   PROXY          необязательно, прокси для запросов к OLX, например http://user:pass@host:port
   RUN_SECONDS    для GitHub Actions: через сколько секунд бот сам остановится (0 = работать вечно)
   FULL_CARDS_FREE  1 = полные карточки (фото, описание, продавец) у всех, 0 = только у премиума
   MAX_AGE_MINUTES  присылать только объявления не старше N минут (по умолчанию 60, 0 = выкл.)
-  MAX_AGE_DAYS   0 = присылать только сегодняшние объявления, 1 = ещё и вчерашние
+  MAX_AGE_DAYS   0 = присылать только сегодняшние объявления, 1 = ещё и вчерашние (если MAX_AGE_MINUTES=0)
+  STRICT_DATE    1 = если возраст объявления определить нельзя, НЕ присылать (по умолчанию 1)
+  SKIP_REFRESHED 1 = не присылать поднятые/обновлённые старые объявления («Оновлено ...»), по умолчанию 1
 Админ-команда /ad ссылка_на_объявление показывает, что бот смог вытащить из страницы.
 """
 import asyncio
@@ -23,7 +25,7 @@ import sqlite3
 import time
 from datetime import date, datetime, timedelta, timezone
 from html import escape
-from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
+from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlparse, urlunparse
 from zoneinfo import ZoneInfo
 
 import aiohttp
@@ -31,24 +33,33 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramForbiddenError
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import (CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
                            InputMediaPhoto, LabeledPrice, LinkPreviewOptions, Message, PreCheckoutQuery)
 from bs4 import BeautifulSoup
 
 TOKEN = os.environ["TG_TOKEN"]
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
-PRICE_STARS = int(os.environ.get("PRICE_STARS", "100"))
 SUPPORT = os.environ.get("SUPPORT", "@admin")
 PROXY = os.environ.get("PROXY") or None
 RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "0"))
 FULL_CARDS_FREE = os.environ.get("FULL_CARDS_FREE", "1") == "1"  # 0 = полные карточки только у премиума
 MAX_PHOTOS = 4
-VERSION = "v6 (фильтр по времени)"
+VERSION = "v7 (строгий фильтр времени, тарифы, рефералка)"
 MAX_AGE_MINUTES = int(os.environ.get("MAX_AGE_MINUTES", "60"))  # объявления старше этого не присылаем (0 = выкл.)
 MAX_AGE_DAYS = int(os.environ.get("MAX_AGE_DAYS", "0"))  # 0 = только сегодняшние, 1 = сегодня и вчера
+STRICT_DATE = os.environ.get("STRICT_DATE", "1") == "1"  # возраст неизвестен -> не присылаем
+SKIP_REFRESHED = os.environ.get("SKIP_REFRESHED", "1") == "1"  # «Оновлено» = старое объявление
 
-PREMIUM_DAYS = 30
+FOREVER_DAYS = 365 * 50                      # «навсегда» = 50 лет
+FOREVER_CUTOFF = 20 * 365 * 86400            # всё, что дальше 20 лет, показываем как «навсегда»
+REF_BONUS_DAYS = 1                           # дней премиума за каждого приглашённого
+# Тарифы. Хочешь добавить ещё — просто допиши строку (ключ без двоеточий).
+PLANS = {
+    "30": {"days": 30, "stars": int(os.environ.get("PRICE_30", "50")), "label": "30 дней"},
+    "90": {"days": 90, "stars": int(os.environ.get("PRICE_90", "130")), "label": "90 дней"},
+    "forever": {"days": FOREVER_DAYS, "stars": int(os.environ.get("PRICE_FOREVER", "1000")), "label": "Навсегда ♾"},
+}
 FREE_LIMIT, PREMIUM_LIMIT = 1, 10            # сколько поисков можно держать
 FREE_INTERVAL, PREMIUM_INTERVAL = 300, 60    # как часто проверять (сек)
 TICK = 15                                    # как часто цикл смотрит, кого пора проверить
@@ -64,14 +75,17 @@ CREATE TABLE IF NOT EXISTS searches(id INTEGER PRIMARY KEY AUTOINCREMENT, user_i
     url TEXT, active INTEGER DEFAULT 1, last_check REAL DEFAULT 0, initialized INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS seen(search_id INTEGER, ad_id TEXT, PRIMARY KEY(search_id, ad_id));
 CREATE TABLE IF NOT EXISTS payments(charge_id TEXT PRIMARY KEY, user_id INTEGER, stars INTEGER, ts REAL);
+CREATE TABLE IF NOT EXISTS referrals(invited_id INTEGER PRIMARY KEY, referrer_id INTEGER, ts REAL);
 """)
 router = Router()
 
 
 # ---------- база ----------
 def ensure_user(uid):
-    db.execute("INSERT OR IGNORE INTO users(id) VALUES(?)", (uid,))
+    """True, если пользователь только что появился в базе."""
+    cur = db.execute("INSERT OR IGNORE INTO users(id) VALUES(?)", (uid,))
     db.commit()
+    return cur.rowcount == 1
 
 
 def premium_until(uid):
@@ -85,6 +99,10 @@ def is_premium(uid):
 
 def fmt_date(ts):
     return time.strftime("%d.%m.%Y", time.localtime(ts))
+
+
+def fmt_until(ts):
+    return "навсегда" if ts - time.time() > FOREVER_CUTOFF else f"до {fmt_date(ts)}"
 
 
 # ---------- свежесть объявлений ----------
@@ -101,35 +119,79 @@ def now_kyiv():
         return datetime.now(timezone(timedelta(hours=2)))
 
 
-def is_fresh_text(text):
-    """True, если по тексту с датой объявление свежее (или дату понять не удалось)."""
-    t = (text or "").lower()
+TIME_RE = re.compile(r"(\d{1,2}):(\d{2})")
+DATE_RE = re.compile(r"(\d{1,2})\s+([а-яіїєґ]+)\s+(\d{4})")
+CARD_DATE_RE = re.compile(r"(?:(?:оновлено|обновлено)\s+)?(?:(?:сьогодні|сегодня|вчора|вчера)\D{0,6}\d{1,2}:\d{2}"
+                          r"|\d{1,2}\s+[а-яіїєґ]+\s+\d{4})", re.I)
+TODAY_WORDS, YESTERDAY_WORDS = ("сьогодні", "сегодня"), ("вчора", "вчера")
+REFRESH_WORDS = ("оновлено", "обновлено")
+
+
+def parse_ad_dt(text):
+    """Текст с датой -> (datetime по Киеву, есть_ли_время) или None, если не поняли."""
+    t = (text or "").lower().replace("\xa0", " ")
     now = now_kyiv()
-    if not t:
-        return True
-    if "сьогодні" in t or "сегодня" in t:
-        m = re.search(r"(\d{1,2}):(\d{2})", t)
-        if MAX_AGE_MINUTES and m:
-            try:
-                ad_time = now.replace(hour=int(m.group(1)) % 24, minute=int(m.group(2)), second=0, microsecond=0)
-            except ValueError:
-                return True
-            if ad_time <= now:
-                return (now - ad_time) <= timedelta(minutes=MAX_AGE_MINUTES)
-        return True
-    if "вчора" in t or "вчера" in t:
-        return MAX_AGE_DAYS >= 1 or now.hour < 1
-    m = re.search(r"(\d{1,2})\s+([а-яіїєґ]+)\s+(\d{4})", t)
-    if not m or m.group(2) not in MONTHS:
-        return True
+    tm = TIME_RE.search(t)
+    hh, mm = (int(tm.group(1)), int(tm.group(2))) if tm else (0, 0)
+    if hh > 23 or mm > 59:
+        tm, hh, mm = None, 0, 0
+    if any(w in t for w in TODAY_WORDS):
+        day = now.date()
+    elif any(w in t for w in YESTERDAY_WORDS):
+        day = now.date() - timedelta(days=1)
+    else:
+        m = DATE_RE.search(t)
+        if not m or m.group(2) not in MONTHS:
+            return None
+        try:
+            day = date(int(m.group(3)), MONTHS[m.group(2)], int(m.group(1)))
+        except ValueError:
+            return None
+    return datetime(day.year, day.month, day.day, hh, mm, tzinfo=now.tzinfo), bool(tm)
+
+
+def age_ok(dt):
+    """Укладывается ли момент dt (aware) в разрешённый возраст."""
+    now = now_kyiv()
+    if MAX_AGE_MINUTES:
+        return now - dt <= timedelta(minutes=MAX_AGE_MINUTES)
+    return dt.date() >= now.date() - timedelta(days=MAX_AGE_DAYS)
+
+
+def freshness(text):
+    """True = свежее, False = старое/поднятое, None = по тексту не понять."""
+    t = (text or "").lower()
+    if SKIP_REFRESHED and any(w in t for w in REFRESH_WORDS):
+        return False
+    p = parse_ad_dt(t)
+    if not p:
+        return None
+    dt, has_time = p
+    if has_time or not MAX_AGE_MINUTES:
+        return age_ok(dt)
+    # дата без времени: если даже самый конец того дня уже слишком давно — старое, иначе не знаем
+    if now_kyiv() - (dt + timedelta(hours=23, minutes=59)) > timedelta(minutes=MAX_AGE_MINUTES):
+        return False
+    return None
+
+
+def parse_iso(s):
     try:
-        ad_date = date(int(m.group(3)), MONTHS[m.group(2)], int(m.group(1)))
-    except ValueError:
-        return True
-    limit = now.date() - timedelta(days=MAX_AGE_DAYS)
-    if now.hour < 1:  # сразу после полуночи не режем вчерашнее
-        limit -= timedelta(days=1)
-    return ad_date >= limit
+        dt = datetime.fromisoformat(str(s).strip().replace("Z", "+00:00"))
+    except Exception:
+        return None
+    tz = now_kyiv().tzinfo
+    return dt.replace(tzinfo=tz) if dt.tzinfo is None else dt.astimezone(tz)
+
+
+def page_freshness(d):
+    """Свежесть по данным со страницы объявления (точное время создания приоритетнее текста)."""
+    if not d:
+        return None
+    dt = parse_iso(d.get("created"))
+    if dt:
+        return age_ok(dt)
+    return freshness(d.get("date"))
 
 
 # ---------- OLX ----------
@@ -165,18 +227,25 @@ async def fetch_ads(session, url):
         loc = card.select_one('[data-testid="location-date"]')
         img = card.select_one("img")
         src = (img.get("src") or "") if img else ""
+        loc_txt = loc.get_text(" ", strip=True) if loc else ""
+        date_txt = loc_txt
+        if parse_ad_dt(loc_txt) is None:  # блок location-date пропал/изменился — ищем дату по всей карточке
+            mm = CARD_DATE_RE.search(card.get_text(" ", strip=True))
+            if mm:
+                date_txt = mm.group(0)
         ads[ad_id] = {
             "link": link,
             "title": (title.get_text(" ", strip=True) if title else "Объявление")[:200],
             "price": price.get_text(" ", strip=True) if price else "",
-            "loc": loc.get_text(" ", strip=True) if loc else "",
+            "loc": loc_txt,
+            "date": date_txt,
             "img": src if src.startswith("http") else "",
         }
     if not ads:  # запасной вариант, если вёрстка карточек поменялась
         for a in soup.select('a[href*="/obyavlenie/"]'):
             ad_id, link = ad_from_link(a)
             ads.setdefault(ad_id, {"link": link, "title": a.get_text(" ", strip=True)[:200] or "Объявление",
-                                   "price": "", "loc": "", "img": ""})
+                                   "price": "", "loc": "", "date": "", "img": ""})
     return ads
 
 
@@ -221,7 +290,7 @@ def since_text(s):
 def parse_ad_page(page):
     """Достаём из страницы объявления описание, фото, продавца, параметры. Несколько способов по очереди."""
     d = {"title": "", "price": "", "desc": "", "photos": [], "seller": "", "since": "",
-         "loc": "", "date": "", "params": []}
+         "loc": "", "date": "", "created": "", "params": []}
     soup = BeautifulSoup(page, "html.parser")
 
     def meta(prop):
@@ -243,6 +312,10 @@ def parse_ad_page(page):
             user = ad.get("user") or {}
             d["seller"] = user.get("name") or ""
             d["since"] = since_text(str(user.get("created") or ""))
+            for k in ("createdTime", "created_time", "createdAt"):
+                if ad.get(k):
+                    d["created"] = str(ad[k])
+                    break
             for p in ad.get("params") or []:
                 if isinstance(p, dict) and p.get("key") != "price" and p.get("name") and p.get("value"):
                     d["params"].append(f"{p['name']}: {p['value']}")
@@ -411,17 +484,27 @@ async def poller(bot):
                     continue
                 db.commit()
                 full = FULL_CARDS_FREE or is_premium(s["user_id"])
-                fresh = []
-                for i, a in new:  # старые и «ТОП» пропускаем
-                    if is_fresh_text(a["loc"]):
-                        fresh.append((i, a))
-                    else:
-                        logging.info("пропущено старое: %s | %s", a["link"], a["loc"])
-                for _, a in reversed(fresh[:10]):  # старые первыми, новые последними
-                    d = await get_details(session, a) if full else None
-                    if d and not is_fresh_text(d.get("date")):
-                        logging.info("пропущено старое (страница): %s | %s", a["link"], d.get("date"))
+                to_send = []
+                for i, a in new[:30]:  # новые идут сверху
+                    f = freshness(a["date"])
+                    if f is False:
+                        logging.info("пропущено старое: %s | %s", a["link"], a["date"])
                         continue
+                    d = None
+                    if f is None or full:
+                        d = await get_details(session, a)
+                        pf = page_freshness(d)
+                        if pf is False:
+                            logging.info("пропущено старое (страница): %s | %s | %s",
+                                         a["link"], d.get("created"), d.get("date"))
+                            continue
+                        if pf is None and f is None and STRICT_DATE:
+                            logging.info("пропущено, возраст неизвестен: %s | %r", a["link"], a["date"])
+                            continue
+                    to_send.append((a, d if full else None))
+                    if len(to_send) >= 10:
+                        break
+                for a, d in reversed(to_send):  # старые первыми, новые последними
                     await send_ad(bot, s["user_id"], a, d)
                     await asyncio.sleep(0.5)
             await asyncio.sleep(TICK)
@@ -433,12 +516,15 @@ def main_kb():
         [InlineKeyboardButton(text="➕ Добавить поиск", callback_data="add")],
         [InlineKeyboardButton(text="📋 Мои поиски", callback_data="list")],
         [InlineKeyboardButton(text="⭐ Премиум", callback_data="premium")],
+        [InlineKeyboardButton(text=f"👥 Пригласить друга (+{REF_BONUS_DAYS} день)", callback_data="ref")],
     ])
 
 
 @router.message(CommandStart())
-async def start(m: Message):
-    ensure_user(m.from_user.id)
+async def start(m: Message, command: CommandObject):
+    is_new = ensure_user(m.from_user.id)
+    if is_new and command.args and command.args.startswith("ref_"):
+        await handle_referral(m.bot, m.from_user.id, command.args[4:])
     await m.answer("Привет! Я слежу за новыми объявлениями на OLX и сразу присылаю их сюда.\n\n"
                    "Открой olx.ua, выставь нужные фильтры и пришли мне ссылку на результаты поиска.",
                    reply_markup=main_kb())
@@ -500,31 +586,99 @@ async def delete(c: CallbackQuery):
     await c.answer("Удалил")
 
 
+# ---------- рефералка ----------
+async def handle_referral(bot, uid, arg):
+    """Новый пользователь пришёл по ссылке ref_<id>: даём пригласившему бонус (один раз за человека)."""
+    try:
+        ref = int(arg)
+    except ValueError:
+        return
+    if ref == uid or not db.execute("SELECT 1 FROM users WHERE id=?", (ref,)).fetchone():
+        return
+    cur = db.execute("INSERT OR IGNORE INTO referrals(invited_id, referrer_id, ts) VALUES(?,?,?)",
+                     (uid, ref, time.time()))
+    if cur.rowcount != 1:
+        db.commit()
+        return
+    until = max(time.time(), premium_until(ref)) + REF_BONUS_DAYS * 86400
+    db.execute("UPDATE users SET premium_until=? WHERE id=?", (until, ref))
+    db.commit()
+    await safe_send(bot, ref, f"🎉 По твоей ссылке пришёл новый пользователь! +{REF_BONUS_DAYS} дн. премиума.\n"
+                              f"Премиум активен {fmt_until(until)}.")
+
+
+@router.callback_query(F.data == "ref")
+async def ref_info(c: CallbackQuery):
+    me = await c.bot.me()
+    link = f"https://t.me/{me.username}?start=ref_{c.from_user.id}"
+    n = db.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=?", (c.from_user.id,)).fetchone()[0]
+    share = "https://t.me/share/url?url=" + quote(link) + "&text=" + quote("Бот, который мгновенно присылает новые объявления с OLX")
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📤 Поделиться ссылкой", url=share)]])
+    await c.message.answer(
+        f"👥 <b>Приглашай друзей — получай премиум</b>\n\n"
+        f"За каждого нового пользователя, который запустит бота по твоей ссылке, "
+        f"ты получаешь <b>+{REF_BONUS_DAYS} день премиума</b>.\n\n"
+        f"Твоя ссылка:\n<code>{link}</code>\n\n"
+        f"Приглашено: {n}\nПолучено: {n * REF_BONUS_DAYS} дн.", reply_markup=kb)
+    await c.answer()
+
+
 # ---------- премиум за Stars ----------
+def plan_line(key):
+    p = PLANS[key]
+    line = f"{p['label']} — {p['stars']} ⭐"
+    if key != "forever" and p["days"] > 30:
+        save = round(100 - 100 * p["stars"] / (PLANS["30"]["stars"] * p["days"] / 30))
+        if save > 0:
+            line += f" (−{save}%)"
+    return line
+
+
 @router.callback_query(F.data == "premium")
 async def premium(c: CallbackQuery):
     until = premium_until(c.from_user.id)
-    status = f"Премиум активен до {fmt_date(until)}." if until > time.time() else "Сейчас у тебя бесплатный тариф."
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
-        text=f"Купить на {PREMIUM_DAYS} дней за {PRICE_STARS} ⭐", callback_data="buy")]])
+    status = f"Премиум активен {fmt_until(until)}." if until > time.time() else "Сейчас у тебя бесплатный тариф."
+    rows = [[InlineKeyboardButton(text=plan_line(k), callback_data=f"buy:{k}")] for k in PLANS]
+    rows.append([InlineKeyboardButton(text=f"👥 Бесплатно за друзей (+{REF_BONUS_DAYS} день)", callback_data="ref")])
     await c.message.answer(
         f"{status}\n\n<b>Бесплатно:</b> {FREE_LIMIT} поиск, проверка раз в {FREE_INTERVAL // 60} мин.\n"
-        f"<b>Премиум:</b> до {PREMIUM_LIMIT} поисков, проверка раз в {PREMIUM_INTERVAL} сек.", reply_markup=kb)
+        f"<b>Премиум:</b> до {PREMIUM_LIMIT} поисков, проверка раз в {PREMIUM_INTERVAL} сек.\n"
+        f"<b>Навсегда:</b> всё то же + все будущие обновления без доплат.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     await c.answer()
 
 
-@router.callback_query(F.data == "buy")
+@router.callback_query(F.data.startswith("buy:"))
 async def buy(c: CallbackQuery):
+    key = c.data.split(":", 1)[1]
+    plan = PLANS.get(key)
+    if not plan:
+        return await c.answer("Тариф не найден", show_alert=True)
     await c.message.answer_invoice(
-        title=f"Премиум на {PREMIUM_DAYS} дней",
+        title=f"Премиум: {plan['label']}",
         description=f"До {PREMIUM_LIMIT} поисков и быстрая проверка новых объявлений",
-        payload=f"premium:{c.from_user.id}", provider_token="", currency="XTR",
-        prices=[LabeledPrice(label="Премиум", amount=PRICE_STARS)])
+        payload=f"premium:{key}:{c.from_user.id}", provider_token="", currency="XTR",
+        prices=[LabeledPrice(label="Премиум", amount=plan["stars"])])
     await c.answer()
+
+
+def plan_from_payload(payload):
+    parts = (payload or "").split(":")
+    if parts[0] != "premium":
+        return None
+    if len(parts) == 2:  # старый формат счёта: premium:<uid> = 30 дней
+        return PLANS["30"]
+    return PLANS.get(parts[1])
 
 
 @router.pre_checkout_query()
 async def pre_checkout(q: PreCheckoutQuery):
+    plan = plan_from_payload(q.invoice_payload)
+    if not plan:
+        return await q.answer(ok=False, error_message="Тариф не найден, открой меню и попробуй снова.")
+    legacy = q.invoice_payload.count(":") == 1
+    if not legacy and q.total_amount != plan["stars"]:
+        return await q.answer(ok=False, error_message="Цена изменилась, открой меню и выбери тариф заново.")
     await q.answer(ok=True)
 
 
@@ -532,14 +686,18 @@ async def pre_checkout(q: PreCheckoutQuery):
 async def paid(m: Message):
     p, uid = m.successful_payment, m.from_user.id
     ensure_user(uid)
-    until = max(time.time(), premium_until(uid)) + PREMIUM_DAYS * 86400
+    plan = plan_from_payload(p.invoice_payload) or PLANS["30"]
+    cur = db.execute("INSERT OR IGNORE INTO payments VALUES(?,?,?,?)",
+                     (p.telegram_payment_charge_id, uid, p.total_amount, time.time()))
+    if cur.rowcount != 1:  # этот платёж уже обработан
+        db.commit()
+        return
+    until = max(time.time(), premium_until(uid)) + plan["days"] * 86400
     db.execute("UPDATE users SET premium_until=? WHERE id=?", (until, uid))
-    db.execute("INSERT OR IGNORE INTO payments VALUES(?,?,?,?)",
-               (p.telegram_payment_charge_id, uid, p.total_amount, time.time()))
     db.commit()
-    await m.answer(f"⭐ Спасибо! Премиум активен до {fmt_date(until)}.", reply_markup=main_kb())
+    await m.answer(f"⭐ Спасибо! Премиум ({plan['label']}) активен {fmt_until(until)}.", reply_markup=main_kb())
     if ADMIN_ID:
-        await safe_send(m.bot, ADMIN_ID, f"💰 Оплата {p.total_amount}⭐ от {uid}\n"
+        await safe_send(m.bot, ADMIN_ID, f"💰 Оплата {p.total_amount}⭐ ({plan['label']}) от {uid}\n"
                                          f"charge_id: <code>{escape(p.telegram_payment_charge_id)}</code>")
 
 
@@ -554,14 +712,16 @@ async def grant(m: Message):
     if m.from_user.id != ADMIN_ID:
         return
     try:
-        uid, days = map(int, m.text.split()[1:3])
-    except ValueError:
-        return await m.answer("Формат: /grant user_id дни")
+        a = m.text.split()[1:3]
+        uid = int(a[0])
+        days = FOREVER_DAYS if a[1].lower() in ("forever", "навсегда") else int(a[1])
+    except (ValueError, IndexError):
+        return await m.answer("Формат: /grant user_id дни (или forever)")
     ensure_user(uid)
     until = max(time.time(), premium_until(uid)) + days * 86400
     db.execute("UPDATE users SET premium_until=? WHERE id=?", (until, uid))
     db.commit()
-    await m.answer(f"Премиум для {uid} до {fmt_date(until)}")
+    await m.answer(f"Премиум для {uid}: {fmt_until(until)}")
 
 
 @router.message(Command("refund"))
@@ -590,8 +750,10 @@ async def debug_ad(m: Message):
     if not d:
         return await m.answer("Не удалось загрузить страницу, смотри лог.")
     lines = [f"{k}: {len(v)} шт." if k == "photos" else f"{k}: {escape(str(v))[:150]}" for k, v in d.items()]
+    verdict = {True: "свежее", False: "старое", None: "неизвестно"}[page_freshness(d)]
+    lines.append(f"→ по странице: {verdict} (лимит {MAX_AGE_MINUTES} мин.)")
     await m.answer("\n".join(lines))
-    await send_ad(m.bot, m.from_user.id, {"link": parts[1], "title": "Объявление", "price": "", "loc": "", "img": ""}, d)
+    await send_ad(m.bot, m.from_user.id, {"link": parts[1], "title": "Объявление", "price": "", "loc": "", "date": "", "img": ""}, d)
 
 
 async def main():
