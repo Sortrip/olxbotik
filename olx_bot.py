@@ -15,6 +15,9 @@ OLX-монитор в Telegram: меню, несколько поисков, к�
   STRICT_DATE    1 = если возраст объявления определить нельзя, НЕ присылать (по умолчанию 1)
   SKIP_REFRESHED 1 = не присылать поднятые/обновлённые старые объявления («Оновлено ...»), по умолчанию 1
   TRIAL_DAYS     сколько дней премиума дарим новому пользователю (по умолчанию 2, 0 = выкл.)
+  FEED_INTERVAL  как часто (сек) опрашивать общую ленту OLX для поиска по словам (по умолчанию 3)
+  FREE_DELAY     задержка (сек) для бесплатных в поиске по словам (по умолчанию 180)
+  NEW_WINDOW_MIN объявление считается «новым», если создано не раньше N минут назад (по умолчанию 60)
 Админ-команды: /ad ссылка, /grant id дни|forever, /refund id charge_id, /stats
 """
 import asyncio
@@ -46,8 +49,8 @@ PROXY = os.environ.get("PROXY") or None
 RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "0"))
 FULL_CARDS_FREE = os.environ.get("FULL_CARDS_FREE", "1") == "1"  # 0 = полные карточки только у премиума
 MAX_PHOTOS = 4
-VERSION = "v8 (10 мин, RU/UA, триал, рефералка 2.0)"
-MAX_AGE_MINUTES = int(os.environ.get("MAX_AGE_MINUTES", "15"))  # объявления старше этого не присылаем (0 = выкл.)
+VERSION = "v9 (лента JSON API, поиск по словам, точный возраст)"
+MAX_AGE_MINUTES = int(os.environ.get("MAX_AGE_MINUTES", "10"))  # объявления старше этого не присылаем (0 = выкл.)
 MAX_AGE_DAYS = int(os.environ.get("MAX_AGE_DAYS", "0"))  # 0 = только сегодняшние, 1 = сегодня и вчера
 STRICT_DATE = os.environ.get("STRICT_DATE", "1") == "1"  # возраст неизвестен -> не присылаем
 SKIP_REFRESHED = os.environ.get("SKIP_REFRESHED", "1") == "1"  # «Оновлено» = старое объявление
@@ -58,6 +61,12 @@ REF_BONUS_DAYS = 1                           # пригласившему, ко�
 REF_INVITED_BONUS_DAYS = 1                   # приглашённому сразу (сверху к триалу)
 MILESTONE_EVERY, MILESTONE_BONUS_DAYS = 5, 7  # каждый 5-й друг = ещё +7 дней
 TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "2"))  # подарок новичку
+FEED_INTERVAL = float(os.environ.get("FEED_INTERVAL", "3"))  # опрос общей ленты, сек
+FEED_LIMIT, FEED_PAGES = 40, 3                      # объявлений на страницу / макс. страниц за опрос
+FREE_DELAY = int(os.environ.get("FREE_DELAY", "180"))  # задержка бесплатным в поиске по словам, сек
+NEW_WINDOW_MIN = int(os.environ.get("NEW_WINDOW_MIN", "60"))  # «новое» = создано не раньше N мин назад
+MODERATION_LAG_MIN = 5                              # создание -> появление в ленте (по данным OLX ~4,4 мин)
+SELLER_NEW_DAYS = 30                                # аккаунт моложе N дней = «свежий продавец»
 # Тарифы. Хочешь добавить ещё — просто допиши строку (ключ без двоеточий).
 PLANS = {
     "30": {"days": 30, "stars": int(os.environ.get("PRICE_30", "50")), "label": "30 дней"},
@@ -98,6 +107,10 @@ if add_column("users", "exp_for REAL DEFAULT 0"):  # первый запуск �
     db.execute("UPDATE users SET exp_for=premium_until WHERE premium_until>0 AND premium_until<?", (time.time(),))
     db.commit()
 add_column("referrals", "rewarded INTEGER DEFAULT 1")  # старые рефералы уже награждены
+add_column("searches", "kind TEXT DEFAULT 'url'")      # url — по ссылке, kw — по словам
+add_column("searches", "q TEXT DEFAULT ''")
+add_column("searches", "pmin INTEGER DEFAULT 0")
+add_column("searches", "pmax INTEGER DEFAULT 0")
 router = Router()
 
 
@@ -105,11 +118,17 @@ router = Router()
 # ---------- тексты ----------
 TXT = {
     "ru": {
-        "start": "Привет! Я слежу за новыми объявлениями на OLX и сразу присылаю их сюда.\n\n"
-                 "Открой olx.ua, выставь нужные фильтры и пришли мне ссылку на результаты поиска.",
+        "start": "Привет! Я слежу за новыми объявлениями на OLX и присылаю их сразу после публикации.\n\n"
+                 "Напиши, что искать, например: <code>iPhone 8 700-1600</code> (слова + цена от-до в грн). "
+                 "Лишнее убирай минусом: <code>-plus</code>.\n\n"
+                 "Или пришли ссылку на поиск с olx.ua — возьму все фильтры оттуда.",
         "gift": "🎁 <b>Подарок: {days} дн. премиума</b> — до {pl} поисков, проверка каждую минуту, карточки без подписи бота. "
                 "Премиум активен {until}.",
-        "add_help": "Открой olx.ua, выставь фильтры (категория, город, цена) и пришли мне ссылку из адресной строки.",
+        "add_help": "Напиши, что искать: <code>iPhone 8 700-1600</code> (слова + цена от-до в грн, минус-слова: <code>-plus</code>).\n"
+                    "Или открой olx.ua, выставь фильтры и пришли ссылку из адресной строки.",
+        "started_kw": "✅ Поиск #{id} запущен: «{q}»{price}\nПришлю новые объявления сразу после публикации.",
+        "new_seller": "Свежий аккаунт продавца — осторожнее с предоплатой",
+        "ago_sec": "⏱ Опубликовано {n} сек. назад", "ago_min": "⏱ Опубликовано {n} мин. назад",
         "limit": "Лимит поисков: {limit}. Удали лишний в «Мои поиски» или возьми премиум 👇",
         "added": "Добавил поиск #{id}. Через несколько секунд подтвержу запуск.",
         "started": "✅ Поиск #{id} запущен. Запомнил {n} текущих объявлений, дальше пришлю только новые.",
@@ -120,8 +139,8 @@ TXT = {
         "done": "Готово", "deleted": "Удалил",
         "active_limit": "Лимит активных поисков: {limit}. Поставь другой на паузу или возьми премиум.",
         "prem_active": "Премиум активен {until}.", "prem_free": "Сейчас у тебя бесплатный тариф.",
-        "prem_body": "<b>Бесплатно:</b> {fl} поиск, проверка раз в {fi} мин.\n"
-                     "<b>Премиум:</b> до {pl} поисков, проверка каждую минуту ⚡, карточки без подписи бота.\n"
+        "prem_body": "<b>Бесплатно:</b> {fl} поиск, новые объявления с задержкой до {fd} мин.\n"
+                     "<b>Премиум:</b> до {pl} поисков, объявления приходят сразу, через секунды после публикации ⚡, карточки без подписи бота.\n"
                      "<b>Навсегда:</b> всё то же + все будущие обновления без доплат.",
         "btn_ref_free": "👥 Бесплатно за друзей",
         "plan_30": "30 дней", "plan_90": "90 дней", "plan_forever": "Навсегда ♾",
@@ -146,19 +165,25 @@ TXT = {
         "expired": "⌛ Премиум закончился. Теперь проверка раз в {fi} мин., активен {fl} поиск.{paused}\n"
                    "Продли, чтобы снова получать объявления за минуту 👇",
         "paused_note": "\nПоисков поставлено на паузу: {n}.",
-        "teaser_age": "⏱ Ты увидел это через {n} мин. после публикации.\n⚡ В премиуме проверка каждую минуту.",
-        "teaser": "⚡ В премиуме проверка каждую минуту, до {pl} поисков.",
+        "teaser_age": "⏱ Ты увидел это через {n} мин. после публикации.\n⚡ В премиуме — сразу, без задержки.",
+        "teaser": "⚡ В премиуме — сразу, без задержки, до {pl} поисков.",
         "btn_speedup": "⚡ Получать быстрее",
         "open_olx": "Открыть на OLX →", "since": "на OLX с {d}",
         "lang_set": "Язык: русский 🇷🇺",
         "forever": "навсегда",
     },
     "ua": {
-        "start": "Привіт! Я стежу за новими оголошеннями на OLX і одразу надсилаю їх сюди.\n\n"
-                 "Відкрий olx.ua, постав потрібні фільтри й надішли мені посилання на результати пошуку.",
+        "start": "Привіт! Я стежу за новими оголошеннями на OLX і надсилаю їх одразу після публікації.\n\n"
+                 "Напиши, що шукати, наприклад: <code>iPhone 8 700-1600</code> (слова + ціна від-до в грн). "
+                 "Зайве прибирай мінусом: <code>-plus</code>.\n\n"
+                 "Або надішли посилання на пошук з olx.ua — візьму всі фільтри звідти.",
         "gift": "🎁 <b>Подарунок: {days} дн. преміуму</b> — до {pl} пошуків, перевірка щохвилини, картки без підпису бота. "
                 "Преміум активний {until}.",
-        "add_help": "Відкрий olx.ua, постав фільтри (категорія, місто, ціна) і надішли мені посилання з адресного рядка.",
+        "add_help": "Напиши, що шукати: <code>iPhone 8 700-1600</code> (слова + ціна від-до в грн, мінус-слова: <code>-plus</code>).\n"
+                    "Або відкрий olx.ua, постав фільтри й надішли посилання з адресного рядка.",
+        "started_kw": "✅ Пошук #{id} запущено: «{q}»{price}\nНадішлю нові оголошення одразу після публікації.",
+        "new_seller": "Свіжий акаунт продавця — обережніше з передоплатою",
+        "ago_sec": "⏱ Опубліковано {n} с тому", "ago_min": "⏱ Опубліковано {n} хв тому",
         "limit": "Ліміт пошуків: {limit}. Видали зайвий у «Мої пошуки» або візьми преміум 👇",
         "added": "Додав пошук #{id}. За кілька секунд підтверджу запуск.",
         "started": "✅ Пошук #{id} запущено. Запам'ятав {n} поточних оголошень, далі надішлю лише нові.",
@@ -169,8 +194,8 @@ TXT = {
         "done": "Готово", "deleted": "Видалив",
         "active_limit": "Ліміт активних пошуків: {limit}. Постав інший на паузу або візьми преміум.",
         "prem_active": "Преміум активний {until}.", "prem_free": "Зараз у тебе безкоштовний тариф.",
-        "prem_body": "<b>Безкоштовно:</b> {fl} пошук, перевірка раз на {fi} хв.\n"
-                     "<b>Преміум:</b> до {pl} пошуків, перевірка щохвилини ⚡, картки без підпису бота.\n"
+        "prem_body": "<b>Безкоштовно:</b> {fl} пошук, нові оголошення із затримкою до {fd} хв.\n"
+                     "<b>Преміум:</b> до {pl} пошуків, оголошення приходять одразу, за секунди після публікації ⚡, картки без підпису бота.\n"
                      "<b>Назавжди:</b> те саме + усі майбутні оновлення без доплат.",
         "btn_ref_free": "👥 Безкоштовно за друзів",
         "plan_30": "30 днів", "plan_90": "90 днів", "plan_forever": "Назавжди ♾",
@@ -195,8 +220,8 @@ TXT = {
         "expired": "⌛ Преміум закінчився. Тепер перевірка раз на {fi} хв., активний {fl} пошук.{paused}\n"
                    "Продовж, щоб знову отримувати оголошення за хвилину 👇",
         "paused_note": "\nПошуків поставлено на паузу: {n}.",
-        "teaser_age": "⏱ Ти побачив це через {n} хв. після публікації.\n⚡ У преміумі перевірка щохвилини.",
-        "teaser": "⚡ У преміумі перевірка щохвилини, до {pl} пошуків.",
+        "teaser_age": "⏱ Ти побачив це через {n} хв. після публікації.\n⚡ У преміумі — одразу, без затримки.",
+        "teaser": "⚡ У преміумі — одразу, без затримки, до {pl} пошуків.",
         "btn_speedup": "⚡ Отримувати швидше",
         "open_olx": "Відкрити на OLX →", "since": "на OLX з {d}",
         "lang_set": "Мова: українська 🇺🇦",
@@ -329,12 +354,15 @@ def parse_iso(s):
 
 
 def page_freshness(d):
-    """Свежесть по данным со страницы объявления (точное время создания приоритетнее текста)."""
+    # Свежесть по данным со страницы. Объявление попадает в ленту через ~4-5 мин после создания (модерация),
+    # поэтому возраст считаем от публикации (last_refresh), а «новое» определяем по времени создания.
     if not d:
         return None
-    dt = parse_iso(d.get("created"))
-    if dt:
-        return age_ok(dt)
+    c, r = parse_iso(d.get("created")), parse_iso(d.get("refreshed"))
+    if c or r:
+        if c and now_kyiv() - c > timedelta(minutes=NEW_WINDOW_MIN):
+            return False  # старое объявление (в т.ч. поднятое)
+        return age_ok(r or (c + timedelta(minutes=MODERATION_LAG_MIN)))
     return freshness(d.get("date"))
 
 
@@ -434,7 +462,7 @@ def since_text(s):
 def parse_ad_page(page):
     """Достаём из страницы объявления описание, фото, продавца, параметры. Несколько способов по очереди."""
     d = {"title": "", "price": "", "desc": "", "photos": [], "seller": "", "since": "",
-         "loc": "", "date": "", "created": "", "params": []}
+         "loc": "", "date": "", "created": "", "refreshed": "", "params": []}
     soup = BeautifulSoup(page, "html.parser")
 
     def meta(prop):
@@ -459,6 +487,10 @@ def parse_ad_page(page):
             for k in ("createdTime", "created_time", "createdAt"):
                 if ad.get(k):
                     d["created"] = str(ad[k])
+                    break
+            for k in ("lastRefreshTime", "last_refresh_time"):
+                if ad.get(k):
+                    d["refreshed"] = str(ad[k])
                     break
             for p in ad.get("params") or []:
                 if isinstance(p, dict) and p.get("key") != "price" and p.get("name") and p.get("value"):
@@ -531,7 +563,7 @@ async def get_details(session, ad):
     return d
 
 
-def build_caption(ad, d, lang="ru", foot_extra=""):
+def build_caption(ad, d, lang="ru", foot_extra="", head_extra=""):
     t = TXT[lang]
     title = ad["title"] if ad["title"] != "Объявление" else (d.get("title") or "Объявление")
     price = ad["price"] or d.get("price", "")
@@ -548,8 +580,11 @@ def build_caption(ad, d, lang="ru", foot_extra=""):
         if re.fullmatch(r"\d{2}\.\d{4}", since):
             since = t["since"].format(d=since)
         head += "👤 " + escape(d["seller"] + (f" · {since}" if since else "")) + "\n"
+    if d.get("fresh_seller"):
+        head += f"⚠️ {escape(t['new_seller'])}\n"
     if d.get("params"):
         head += "🔧 " + escape(" · ".join(d["params"][:5])) + "\n"
+    head += head_extra
     foot = f'\n<a href="{ad["link"]}">{t["open_olx"]}</a>' + foot_extra
     budget = 1024 - len(head) - len(foot) - 30
     desc = re.sub(r"\n{3,}", "\n\n", d.get("desc", "")).strip()
@@ -561,8 +596,13 @@ def build_caption(ad, d, lang="ru", foot_extra=""):
 
 
 def ad_age_minutes(ad, d):
-    """Сколько минут объявлению (для подписи у бесплатных), None — если неизвестно."""
-    dt = parse_iso((d or {}).get("created"))
+    # Сколько минут назад объявление опубликовано (для подписи у бесплатных); None — если неизвестно.
+    d = d or {}
+    dt = parse_iso(d.get("published") or d.get("refreshed"))
+    if not dt:
+        c = parse_iso(d.get("created"))
+        if c:
+            dt = c + timedelta(minutes=MODERATION_LAG_MIN)
     if not dt:
         p = parse_ad_dt(ad.get("date"))
         if p and p[1]:
@@ -573,19 +613,32 @@ def ad_age_minutes(ad, d):
     return n if 1 <= n <= 120 else None
 
 
+def ago_text(lang, d):
+    # Строка «опубликовано N сек. назад» — доказательство скорости для премиум-пользователей.
+    pdt = parse_iso((d or {}).get("published"))
+    if not pdt:
+        return ""
+    sec = max(0, int((now_kyiv() - pdt).total_seconds()))
+    t = TXT[lang]
+    return (t["ago_sec"].format(n=sec) if sec < 120 else t["ago_min"].format(n=sec // 60)) + "\n"
+
+
 async def send_ad(bot, uid, ad, d=None):
     d = d or {}
     lang = lang_of(uid)
     t = TXT[lang]
-    foot_extra, rows = "", [[InlineKeyboardButton(text=t["open_olx"], url=ad["link"])]]
-    if not is_premium(uid):
+    premium = is_premium(uid)
+    foot_extra, head_extra, rows = "", "", [[InlineKeyboardButton(text=t["open_olx"], url=ad["link"])]]
+    if premium:
+        head_extra = ago_text(lang, d)
+    else:
         # бесплатным: подсказка про скорость премиума + реф-ссылка в подписи (карточки пересылают → приток людей)
         me = await bot.me()
         age = ad_age_minutes(ad, d)
         hint = t["teaser_age"].format(n=age) if age else t["teaser"].format(pl=PREMIUM_LIMIT)
         foot_extra = f'\n\n{hint}\n🤖 <a href="https://t.me/{me.username}?start=ref_{uid}">@{me.username}</a>'
         rows.append([InlineKeyboardButton(text=t["btn_speedup"], callback_data="premium")])
-    text = build_caption(ad, d, lang, foot_extra)
+    text = build_caption(ad, d, lang, foot_extra, head_extra)
     photos = d.get("photos") or ([ad["img"]] if ad["img"] else [])
     kb = InlineKeyboardMarkup(inline_keyboard=rows)
     try:
@@ -620,7 +673,7 @@ async def poller(bot):
     async with aiohttp.ClientSession() as session:
         while True:
             now = time.time()
-            due = [s for s in db.execute("SELECT * FROM searches WHERE active=1").fetchall()
+            due = [s for s in db.execute("SELECT * FROM searches WHERE active=1 AND kind='url'").fetchall()
                    if now - s["last_check"] >= (PREMIUM_INTERVAL if is_premium(s["user_id"]) else FREE_INTERVAL)]
             cache = {}  # одинаковые ссылки грузим один раз за круг
             for s in due:
@@ -677,6 +730,256 @@ async def poller(bot):
                     await send_ad(bot, s["user_id"], a, d)
                     await asyncio.sleep(0.5)
             await asyncio.sleep(TICK)
+
+
+# ---------- общая лента OLX (JSON API) и поиск по словам ----------
+FEED_URL = "https://www.olx.ua/api/v1/offers/"
+API_HEADERS = {"User-Agent": HEADERS["User-Agent"], "Accept": "application/json", "Accept-Language": "uk,ru;q=0.9"}
+
+
+def norm_title(s):
+    s = (s or "").lower().replace("ё", "е")
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", s)).strip()
+
+
+def parse_query(q):
+    # «iphone 8 -plus» -> нужные слова ['iphone','8'], исключения ['plus']
+    pos, neg = [], []
+    for raw in (q or "").split():
+        if raw.startswith("-") and len(raw) > 1:
+            neg += norm_title(raw[1:]).split()
+        else:
+            pos += norm_title(raw).split()
+    return pos, neg
+
+
+def title_has(title_n, tok):
+    # слово должно НАЧИНАТЬСЯ с tok: «8» найдёт «iphone 8», но не «iphone 128gb»
+    return re.search(r"(?<!\w)" + re.escape(tok), title_n) is not None
+
+
+def ad_matches(s, ad, parsed=None):
+    pos, neg = parsed or parse_query(s["q"])
+    if not pos:
+        return False
+    t = ad["title_n"]
+    if not all(title_has(t, w) for w in pos):
+        return False
+    if any(title_has(t, w) for w in neg):
+        return False
+    if s["pmin"] or s["pmax"]:
+        p = ad.get("price_uah")
+        if p is None:
+            return False
+        if s["pmin"] and p < s["pmin"]:
+            return False
+        if s["pmax"] and p > s["pmax"]:
+            return False
+    return True
+
+
+def price_note(pmin, pmax):
+    if pmin and pmax:
+        return f" · {pmin}–{pmax} грн"
+    if pmax:
+        return f" · ≤ {pmax} грн"
+    if pmin:
+        return f" · ≥ {pmin} грн"
+    return ""
+
+
+def parse_kw(text):
+    # «iphone 8 -plus 700-1600» / «ps5 до 15000» / «ps5 від 8000» -> (запрос, цена от, цена до)
+    t = re.sub(r"\s+", " ", (text or "").strip())
+    t = re.sub(r"\s*(грн\.?|uah|₴)\s*$", "", t, flags=re.I)
+    pmin = pmax = 0
+    m = re.search(r"(?:^|\s)(\d{2,7})\s*[-–—]\s*(\d{2,7})$", t)
+    if m:
+        pmin, pmax = sorted((int(m.group(1)), int(m.group(2))))
+        t = t[:m.start()]
+    else:
+        m = re.search(r"(?:^|\s)(?:до|up to|<=?)\s*(\d{2,7})$", t, flags=re.I)
+        if m:
+            pmax = int(m.group(1))
+            t = t[:m.start()]
+        else:
+            m = re.search(r"(?:^|\s)(?:від|от|from|>=?)\s*(\d{2,7})$", t, flags=re.I)
+            if m:
+                pmin = int(m.group(1))
+                t = t[:m.start()]
+    return t.strip()[:100], pmin, pmax
+
+
+def normalize_offer(it):
+    # Один объект из JSON-ленты OLX -> карточка для send_ad (+ подробности без похода на страницу).
+    try:
+        if it.get("status") not in (None, "active"):
+            return None  # берём только опубликованные
+        link = (it.get("url") or "").strip()
+        if not link:
+            return None
+        title = (it.get("title") or "Объявление").strip()
+        created = parse_iso(it.get("created_time"))
+        refreshed = parse_iso(it.get("last_refresh_time")) or created
+        price_label, price_uah, extra = "", None, []
+        for p in it.get("params") or []:
+            if not isinstance(p, dict):
+                continue
+            v = p.get("value") if isinstance(p.get("value"), dict) else {}
+            if p.get("key") == "price":
+                price_label = v.get("label") or ""
+                val = v.get("converted_value") if v.get("converted_value") is not None else v.get("value")
+                if isinstance(val, (int, float)):
+                    price_uah = float(val)
+                if price_label and v.get("negotiable"):
+                    price_label += " (торг)"
+            elif p.get("name") and v.get("label"):
+                extra.append(f"{p['name']}: {v['label']}")
+        loc = it.get("location") or {}
+        city = (loc.get("city") or {}).get("name") or (loc.get("region") or {}).get("name") or ""
+        district = (loc.get("district") or {}).get("name") or ""
+        loc_str = ", ".join(x for x in (city, district) if x)
+        user = it.get("user") or {}
+        reg = parse_iso(user.get("created"))
+        photos = []
+        for ph in it.get("photos") or []:
+            u = fix_photo(ph)
+            if u:
+                photos.append(u.replace(":443/", "/"))
+            if len(photos) >= MAX_PHOTOS:
+                break
+        d = {
+            "title": title, "price": price_label, "loc": loc_str, "date": "", "params": extra[:6],
+            "desc": html_to_text(it.get("description") or ""), "photos": photos,
+            "seller": user.get("name") or "",
+            "since": f"{reg.month:02d}.{reg.year}" if reg else "",
+            "fresh_seller": bool(reg and now_kyiv() - reg <= timedelta(days=SELLER_NEW_DAYS)),
+            "created": created.isoformat() if created else "",
+            "published": refreshed.isoformat() if refreshed else "",
+        }
+        return {"id": str(it["id"]), "link": link, "title": title[:200], "price": price_label, "loc": loc_str,
+                "img": photos[0] if photos else "", "date": "", "price_uah": price_uah,
+                "title_n": norm_title(title), "created_dt": created, "pub_dt": refreshed,
+                "promoted": False, "d": d}
+    except Exception as e:
+        logging.info("normalize_offer: %s", e)
+        return None
+
+
+def feed_fresh(ad):
+    # «Новое»: создано не раньше NEW_WINDOW_MIN мин назад (отсекает поднятые старые) И опубликовано не раньше лимита.
+    c, p = ad["created_dt"], ad["pub_dt"]
+    if not c or not p:
+        return False
+    if now_kyiv() - c > timedelta(minutes=NEW_WINDOW_MIN):
+        return False
+    return age_ok(p)
+
+
+async def feed_page(session, offset=0):
+    params = {"offset": offset, "limit": FEED_LIMIT, "sort_by": "created_at:desc"}
+    async with session.get(FEED_URL, params=params, headers=API_HEADERS, proxy=PROXY,
+                           timeout=aiohttp.ClientTimeout(total=15)) as r:
+        if r.status != 200:
+            raise RuntimeError(f"HTTP {r.status}")
+        data = await r.json(content_type=None)
+    items = data.get("data") or []
+    promoted = set((data.get("metadata") or {}).get("promoted") or [])
+    ads = []
+    for i, it in enumerate(items):
+        ad = normalize_offer(it)
+        if ad:
+            ad["promoted"] = i in promoted
+            ads.append(ad)
+    return ads
+
+
+async def fetch_feed(session):
+    # Свежие объявления из общей ленты. Идём по страницам, пока на них есть недавно опубликованное.
+    out, ids = [], set()
+    for page in range(FEED_PAGES):
+        ads = await feed_page(session, page * FEED_LIMIT)
+        recent = False
+        for ad in ads:
+            if not ad["promoted"] and ad["pub_dt"] and age_ok(ad["pub_dt"]):
+                recent = True
+            if ad["id"] not in ids and feed_fresh(ad):
+                ids.add(ad["id"])
+                out.append(ad)
+        if not recent:
+            break
+    return out
+
+
+async def deliver_ad(bot, uid, sid, ad):
+    row = db.execute("SELECT active FROM searches WHERE id=?", (sid,)).fetchone()
+    if not row or not row["active"]:
+        return
+    cur = db.execute("INSERT OR IGNORE INTO seen VALUES(?,?)", (sid, ad["id"]))
+    db.commit()
+    if cur.rowcount != 1:  # уже отправляли
+        return
+    full = FULL_CARDS_FREE or is_premium(uid)
+    await send_ad(bot, uid, ad, ad["d"] if full else None)
+    await asyncio.sleep(0.05)
+
+
+async def init_kw_searches(bot):
+    # Новый поиск по словам стартует «с этой секунды»: старое не присылаем.
+    for s in db.execute("SELECT * FROM searches WHERE active=1 AND kind='kw' AND initialized=0").fetchall():
+        db.execute("UPDATE searches SET initialized=1, last_check=? WHERE id=?", (time.time(), s["id"]))
+        db.commit()
+        await safe_send(bot, s["user_id"], tr(s["user_id"], "started_kw", id=s["id"], q=escape(s["q"]),
+                                              price=price_note(s["pmin"], s["pmax"])))
+
+
+async def dispatch_feed(bot, ads, pending):
+    # Сопоставляем свежие объявления со всеми поисками по словам. Премиум — сразу, бесплатные — с задержкой.
+    for s in db.execute("SELECT * FROM searches WHERE active=1 AND kind='kw' AND initialized=1").fetchall():
+        uid, parsed = s["user_id"], parse_query(s["q"])
+        for ad in ads:
+            if not ad_matches(s, ad, parsed):
+                continue
+            key = (s["id"], ad["id"])
+            if key in pending or db.execute("SELECT 1 FROM seen WHERE search_id=? AND ad_id=?", key).fetchone():
+                continue
+            if is_premium(uid):
+                await deliver_ad(bot, uid, s["id"], ad)
+            else:
+                pending[key] = (time.time() + FREE_DELAY, uid, ad)
+
+
+async def deliver_pending(bot, pending):
+    now = time.time()
+    for key in [k for k, v in pending.items() if v[0] <= now]:
+        _, uid, ad = pending.pop(key)
+        await deliver_ad(bot, uid, key[0], ad)
+
+
+async def feed_poller(bot):
+    done, pending, fails = {}, {}, 0
+    async with aiohttp.ClientSession() as session:
+        while True:
+            t0 = time.time()
+            try:
+                await init_kw_searches(bot)
+                ads = await fetch_feed(session)
+                fails = 0
+                fresh = [a for a in ads if a["id"] not in done]
+                for a in fresh:
+                    done[a["id"]] = t0
+                if fresh:
+                    await dispatch_feed(bot, fresh, pending)
+                await deliver_pending(bot, pending)
+                for k in [k for k, v in done.items() if t0 - v > 1800]:
+                    del done[k]
+            except Exception as e:
+                fails += 1
+                logging.warning("feed error (%s): %s", fails, e)
+                if fails == 10 and ADMIN_ID:
+                    await safe_send(bot, ADMIN_ID, f"⚠️ Лента OLX не отвечает ({e}). Поиск по словам не работает.")
+                await asyncio.sleep(min(3 * fails, 60))
+            await asyncio.sleep(max(0.5, FEED_INTERVAL - (time.time() - t0)))
 
 
 # ---------- меню ----------
@@ -761,6 +1064,27 @@ async def add_search(m: Message):
     await reward_referrer(m.bot, uid)  # друг добавил первый поиск -> бонус пригласившему
 
 
+@router.message(F.text & ~F.text.startswith("/"))
+async def add_keyword_search(m: Message):
+    uid = m.from_user.id
+    ensure_user(uid, m.from_user.language_code)
+    text = (m.text or "").strip()
+    if re.search(r"https?://", text):  # ссылка, но не с olx.ua
+        return await m.answer(tr(uid, "add_help"))
+    q, pmin, pmax = parse_kw(text)
+    if len(re.sub(r"[\s\-]", "", q)) < 2 or not parse_query(q)[0]:
+        return await m.answer(tr(uid, "add_help"))
+    limit = PREMIUM_LIMIT if is_premium(uid) else FREE_LIMIT
+    count = db.execute("SELECT COUNT(*) FROM searches WHERE user_id=?", (uid,)).fetchone()[0]
+    if count >= limit:
+        return await m.answer(tr(uid, "limit", limit=limit), reply_markup=premium_kb(uid))
+    cur = db.execute("INSERT INTO searches(user_id, url, kind, q, pmin, pmax) VALUES(?,?,?,?,?,?)",
+                     (uid, "kw:" + q, "kw", q, pmin, pmax))
+    db.commit()
+    await m.answer(tr(uid, "added", id=cur.lastrowid))
+    await reward_referrer(m.bot, uid)
+
+
 @router.callback_query(F.data == "list")
 async def list_searches(c: CallbackQuery):
     uid = c.from_user.id
@@ -771,7 +1095,10 @@ async def list_searches(c: CallbackQuery):
         return await c.answer()
     lines, buttons = [], []
     for s in rows:
-        path = urlparse(s["url"]).path.strip("/")[:45] or "olx.ua"
+        if s["kind"] == "kw":
+            path = s["q"][:45] + price_note(s["pmin"], s["pmax"])
+        else:
+            path = urlparse(s["url"]).path.strip("/")[:45] or "olx.ua"
         lines.append(f"#{s['id']} {'🟢' if s['active'] else '⏸'} {escape(path)}")
         buttons.append([InlineKeyboardButton(text=t["btn_pause" if s["active"] else "btn_resume"].format(id=s["id"]),
                                              callback_data=f"toggle:{s['id']}"),
@@ -860,7 +1187,7 @@ async def premium(c: CallbackQuery):
     t = TXT[lang_of(uid)]
     until = premium_until(uid)
     status = t["prem_active"].format(until=fmt_until(until, lang_of(uid))) if until > time.time() else t["prem_free"]
-    body = t["prem_body"].format(fl=FREE_LIMIT, fi=FREE_INTERVAL // 60, pl=PREMIUM_LIMIT)
+    body = t["prem_body"].format(fl=FREE_LIMIT, fd=max(FREE_DELAY, FREE_INTERVAL) // 60, pl=PREMIUM_LIMIT)
     await c.message.answer(f"{status}\n\n{body}", reply_markup=premium_kb(uid))
     await c.answer()
 
@@ -956,6 +1283,29 @@ async def refund(m: Message):
         await m.answer(f"Формат: /refund user_id charge_id\nОшибка: {escape(str(e))}")
 
 
+@router.message(Command("feed"))
+async def feed_debug(m: Message):
+    if m.from_user.id != ADMIN_ID:
+        return
+    async with aiohttp.ClientSession() as session:
+        try:
+            ads = await feed_page(session, 0)
+        except Exception as e:
+            return await m.answer(f"Лента не открылась: {escape(str(e))}\nЕсли HTTP 403/429 — нужен прокси (PROXY) или другой сервер.")
+    now = now_kyiv()
+    fresh = [a for a in ads if feed_fresh(a)]
+
+    def hm(dt):
+        return dt.strftime("%H:%M:%S") if dt else "?"
+
+    lines = [f"Лента ок: {len(ads)} объявл. на странице, свежих по правилам: {len(fresh)} "
+             f"(возраст ≤ {MAX_AGE_MINUTES} мин., «новое» ≤ {NEW_WINDOW_MIN} мин.)"]
+    for a in sorted(ads, key=lambda x: x["pub_dt"] or now, reverse=True)[:6]:
+        lines.append(f"{'🟢' if feed_fresh(a) else '⚪'} {a['id']} создано {hm(a['created_dt'])} → в ленте {hm(a['pub_dt'])} "
+                     f"| {escape(a['title'][:30])}")
+    await m.answer("\n".join(lines))
+
+
 @router.message(Command("stats"))
 async def stats(m: Message):
     if m.from_user.id != ADMIN_ID:
@@ -1044,6 +1394,7 @@ async def main():
                         disable_notification=True)
     task = asyncio.create_task(poller(bot))
     watch = asyncio.create_task(premium_watch(bot))
+    feed = asyncio.create_task(feed_poller(bot))
     if RUN_SECONDS:
         async def stopper():
             await asyncio.sleep(RUN_SECONDS)
@@ -1054,6 +1405,7 @@ async def main():
     finally:
         task.cancel()
         watch.cancel()
+        feed.cancel()
         db.commit()
         db.close()
 
